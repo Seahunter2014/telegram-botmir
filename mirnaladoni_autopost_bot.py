@@ -1,14 +1,14 @@
-import asyncio
+import html
 import logging
 import os
 import random
 import sqlite3
 from datetime import datetime
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -21,15 +21,17 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@NadoTurKrd")
 TELEGRAM_ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0") or 0)
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
 POST_TIMES = os.getenv("POST_TIMES", "09:00,14:00,19:00")
 DB_PATH = os.getenv("DB_PATH", "mirnaladoni_bot.db")
 DEFAULT_MARKER = os.getenv("DEFAULT_MARKER", "98526")
 CHANNEL_NAME = os.getenv("CHANNEL_NAME", "МирНаЛадони")
 BOT_NAME = os.getenv("BOT_NAME", "Турджин")
-TIMEZONE = os.getenv("TIMEZONE", "Europe/Berlin")
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Istanbul")
 AUTOPOST_ENABLED = os.getenv("AUTOPOST_ENABLED", "true").lower() == "true"
 
 if not TELEGRAM_BOT_TOKEN:
@@ -189,7 +191,7 @@ CATEGORY_HINTS = {
     "lounges": ["лаунж", "бизнес-зал", "бизнес зал", "зал ожидания"],
     "tours": ["тур", "путев", "все включено", "горящ", "курорт"],
     "transport": ["поезд", "жд", "автобус", "маршрут", "rail"],
-    "insurance": ["страхов", "полис", "медицина", "виз", "безопас"],
+    "insurance": ["страхов", "полис", "медицина", "безопас"],
     "transfers": ["трансфер", "такси", "из аэропорта", "до отеля"],
     "car_rental": ["аренда авто", "машин", "скутер", "байк", "прокат"],
     "excursions": ["экскурс", "гид", "маршрут", "что посмотреть", "прогулк"],
@@ -362,8 +364,6 @@ def is_admin(update: Update) -> bool:
 
 
 def add_marker(url: str, marker: str = DEFAULT_MARKER) -> str:
-    if url.startswith("REPLACE_"):
-        return url
     parsed = urlparse(url)
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     query["marker"] = marker
@@ -424,9 +424,12 @@ def choose_service(topic: str, goal: str, post_type: str) -> dict | None:
     candidates = SERVICES.get(category, [])
     if not candidates:
         return None
+
     recent_anchors = set(get_recent_anchors())
-    random.shuffle(candidates)
-    for service in candidates:
+    shuffled = candidates[:]
+    random.shuffle(shuffled)
+
+    for service in shuffled:
         anchors = [a for a in service["anchors"] if a not in recent_anchors] or service["anchors"]
         anchor = random.choice(anchors)
         return {
@@ -448,10 +451,10 @@ async def generate_post(topic: str, post_type: str, goal: str) -> tuple[str, dic
     elif post_type in {"engagement", "trust"} and random.random() < 0.15:
         service = choose_service(topic, goal, post_type)
 
-    monetization_block = "Не вставляй ссылок."
+    monetization_block = "Не добавляй ссылок."
     if service:
         monetization_block = (
-            f"Добавь ровно одну markdown-ссылку вида [{service['anchor']}]({service['final_link']}) "
+            f'Добавь ровно одну HTML-ссылку вида <a href="{html.escape(service["final_link"], quote=True)}">{html.escape(service["anchor"])}</a> '
             f"в естественную фразу по смыслу. Не упоминай название сервиса {service['name']}. "
             f"Не пиши, что ссылка партнерская. Ссылка должна смотреться нативно."
         )
@@ -479,11 +482,13 @@ async def generate_post(topic: str, post_type: str, goal: str) -> tuple[str, dic
 - НЕ упоминай бренды сервисов бронирования, билетов, экскурсий и т.п.
 - не пиши, что это реклама
 - не используй кликбейт уровня мусорного паблика
+- верни только HTML для Telegram
+- разрешены теги: <b>, <i>, <a>
 
 Монетизация:
 {monetization_block}
 
-Верни только готовый markdown-текст поста. Без пояснений.
+Верни только готовый HTML-текст поста. Без пояснений.
 """
 
     response = await client.chat.completions.create(
@@ -494,7 +499,7 @@ async def generate_post(topic: str, post_type: str, goal: str) -> tuple[str, dic
             {"role": "user", "content": prompt},
         ],
     )
-    text = response.choices[0].message.content.strip()
+    text = (response.choices[0].message.content or "").strip()
     return text, service
 
 
@@ -503,20 +508,23 @@ async def autopost_job(app: Application) -> None:
     goal = choose_goal(post_type)
     topic = choose_topic(post_type)
     logger.info("Autopost started | type=%s | goal=%s | topic=%s", post_type, goal, topic)
+
     content, service = await generate_post(topic, post_type, goal)
     post_id = save_post(topic, post_type, goal, content, service)
+
     await app.bot.send_message(
         chat_id=TELEGRAM_CHANNEL_ID,
         text=content,
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
     mark_published(post_id)
     logger.info("Autopost published | post_id=%s", post_id)
+
     try:
         await app.bot.send_message(
             chat_id=TELEGRAM_ADMIN_ID,
-            text=f"Автопост опубликован. ID: {post_id}\nТема: {topic}\nТип: {post_type}",
+            text=f"Автопост опубликован.\nID: {post_id}\nТема: {topic}\nТип: {post_type}",
         )
     except Exception as exc:
         logger.warning("Cannot notify admin: %s", exc)
@@ -541,23 +549,35 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await start_cmd(update, context)
+
+
 async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update):
         await update.message.reply_text("Доступ только для администратора.")
         return
+
     topic = " ".join(context.args).strip() or choose_topic("selling")
     post_type = choose_post_type()
     goal = choose_goal(post_type)
+
     await update.message.reply_text("Генерирую пост...")
     content, service = await generate_post(topic, post_type, goal)
     post_id = save_post(topic, post_type, goal, content, service)
+
     meta = [f"ID: {post_id}", f"Тип: {post_type}", f"Цель: {goal}"]
     if service:
         meta.append(f"Категория: {service['category']}")
         meta.append(f"Сервис: {service['name']} (внутренне)")
+
     await update.message.reply_text(
-        content[:3900] + "\n\n" + "\n".join(meta),
-        parse_mode=ParseMode.MARKDOWN,
+        "\n".join(meta),
+        disable_web_page_preview=True,
+    )
+    await update.message.reply_text(
+        content[:3900],
+        parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
 
@@ -569,14 +589,16 @@ async def publish_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text("Пример: /publish 12")
         return
+
     post = get_post(int(context.args[0]))
     if not post:
         await update.message.reply_text("Пост не найден.")
         return
+
     await context.bot.send_message(
         chat_id=TELEGRAM_CHANNEL_ID,
         text=post["content"],
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
     mark_published(post["id"])
@@ -587,13 +609,18 @@ async def last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update):
         await update.message.reply_text("Доступ только для администратора.")
         return
+
     post = get_last_post()
     if not post:
         await update.message.reply_text("Постов пока нет.")
         return
+
     await update.message.reply_text(
-        post["content"][:3900] + f"\n\nID: {post['id']}\nОпубликован: {'да' if post['published'] else 'нет'}",
-        parse_mode=ParseMode.MARKDOWN,
+        f"ID: {post['id']}\nОпубликован: {'да' if post['published'] else 'нет'}",
+    )
+    await update.message.reply_text(
+        post["content"][:3900],
+        parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
 
@@ -602,6 +629,7 @@ async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not is_admin(update):
         await update.message.reply_text("Доступ только для администратора.")
         return
+
     status = get_setting("autopost_enabled", "true")
     await update.message.reply_text(
         f"Автопостинг: {'включен' if status == 'true' else 'выключен'}\n"
@@ -630,7 +658,10 @@ async def test_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not is_admin(update):
         await update.message.reply_text("Доступ только для администратора.")
         return
-    await context.bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text="Тест публикации от бота МирНаЛадони ✅")
+    await context.bot.send_message(
+        chat_id=TELEGRAM_CHANNEL_ID,
+        text="Тест публикации от бота МирНаЛадони ✅",
+    )
     await update.message.reply_text("Тест отправлен в канал.")
 
 
@@ -644,7 +675,8 @@ def create_scheduler(app: Application) -> AsyncIOScheduler:
         hour, minute = time_str.split(":")
 
         async def job_wrapper(application: Application = app):
-            if get_setting("autopost_enabled", "true" if AUTOPOST_ENABLED else "false") != "true":
+            enabled = get_setting("autopost_enabled", "true" if AUTOPOST_ENABLED else "false")
+            if enabled != "true":
                 logger.info("Autopost skipped: disabled")
                 return
             try:
@@ -659,29 +691,60 @@ def create_scheduler(app: Application) -> AsyncIOScheduler:
                 except Exception:
                     pass
 
-        scheduler.add_job(job_wrapper, "cron", hour=int(hour), minute=int(minute), misfire_grace_time=300)
+        scheduler.add_job(
+            job_wrapper,
+            "cron",
+            hour=int(hour),
+            minute=int(minute),
+            misfire_grace_time=300,
+            id=f"autopost_{hour}_{minute}",
+            replace_existing=True,
+        )
 
     return scheduler
 
 
 async def post_init(app: Application) -> None:
     init_db()
-    save_setting("autopost_enabled", "true" if AUTOPOST_ENABLED else "false")
+
+    if get_setting("autopost_enabled", "") == "":
+        save_setting("autopost_enabled", "true" if AUTOPOST_ENABLED else "false")
+
     scheduler = create_scheduler(app)
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
     logger.info("Scheduler started | times=%s", POST_TIMES)
 
 
+async def post_shutdown(app: Application) -> None:
+    scheduler = app.bot_data.get("scheduler")
+    if scheduler:
+        scheduler.shutdown(wait=False)
+        logger.info("Scheduler stopped")
+
+
 def main() -> None:
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    logger.info("Bot starting...")
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("gen", gen_cmd))
     app.add_handler(CommandHandler("publish", publish_cmd))
     app.add_handler(CommandHandler("last", last_cmd))
-    print("Bot is running...")
+    app.add_handler(CommandHandler("schedule", schedule_cmd))
+    app.add_handler(CommandHandler("autopost_on", autopost_on_cmd))
+    app.add_handler(CommandHandler("autopost_off", autopost_off_cmd))
+    app.add_handler(CommandHandler("test_channel", test_channel_cmd))
+
     app.run_polling()
 
 
