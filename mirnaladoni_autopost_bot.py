@@ -1,47 +1,42 @@
-import html
+import asyncio
 import logging
 import os
 import random
 import sqlite3
-from datetime import datetime
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from contextlib import closing
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, List, Tuple
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from telegram import Update
-from telegram.constants import ParseMode
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.error import Forbidden
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
 
-# =========================
-# Config
-# =========================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@NadoTurKrd")
-TELEGRAM_ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0") or 0)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
+TEST_CHANNEL_ID = os.getenv("TEST_CHANNEL_ID", "").strip()
+TELEGRAM_ADMIN_ID_RAW = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-POST_TIMES = os.getenv("POST_TIMES", "09:00,14:00,19:00")
-DB_PATH = os.getenv("DB_PATH", "mirnaladoni_bot.db")
-DEFAULT_MARKER = os.getenv("DEFAULT_MARKER", "98526")
-CHANNEL_NAME = os.getenv("CHANNEL_NAME", "МирНаЛадони")
-BOT_NAME = os.getenv("BOT_NAME", "Турджин")
-TIMEZONE = os.getenv("TIMEZONE", "Europe/Istanbul")
-AUTOPOST_ENABLED = os.getenv("AUTOPOST_ENABLED", "true").lower() == "true"
+TELEGRAM_ADMIN_ID = int(TELEGRAM_ADMIN_ID_RAW) if TELEGRAM_ADMIN_ID_RAW else None
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
-if not TELEGRAM_ADMIN_ID:
-    raise RuntimeError("TELEGRAM_ADMIN_ID not set")
+    raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN")
+if not TELEGRAM_CHANNEL_ID:
+    raise RuntimeError("Не задан TELEGRAM_CHANNEL_ID")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY not set")
+    raise RuntimeError("Не задан OPENAI_API_KEY")
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "bot.db"
+PHOTOS_DIR = BASE_DIR / "photos"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,703 +44,843 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mirnaladoni_bot")
 
-# =========================
-# Affiliate services from user file
-# =========================
-SERVICES = {
-    "hotels": [
-        {
-            "name": "Островок",
-            "url": "https://ostrovok.tp.st/yHBoZUg7",
-            "anchors": ["подобрать жильё", "посмотреть варианты проживания"],
-        },
-        {
-            "name": "Отелло",
-            "url": "https://otello.tp.st/lG6I9cfN",
-            "anchors": ["найти отель", "посмотреть хорошие варианты"],
-        },
-        {
-            "name": "Яндекс.Трэвел",
-            "url": "https://yandex.tp.st/y94GSOah",
-            "anchors": ["сравнить варианты размещения", "посмотреть жильё и билеты"],
-        },
-    ],
-    "flights": [
-        {
-            "name": "Aviasales",
-            "url": "https://aviasales.tp.st/hYipm2Ac",
-            "anchors": ["посмотреть билеты", "проверить цены на перелёт"],
-        }
-    ],
-    "lounges": [
-        {
-            "name": "VIP Залы",
-            "url": "https://vip-zal.tp.st/VUTiM7FJ",
-            "anchors": ["забронировать лаунж", "посмотреть доступные лаунжи"],
-        }
-    ],
-    "tours": [
-        {
-            "name": "Onlinetours",
-            "url": "https://onlinetours.tp.st/Um2ycow9",
-            "anchors": ["подобрать тур онлайн", "посмотреть пакетные туры"],
-        },
-        {
-            "name": "YouTravel",
-            "url": "https://youtravel.tp.st/l1ay1eTX",
-            "anchors": ["найти авторский тур", "посмотреть необычные маршруты"],
-        },
-        {
-            "name": "Level.travel",
-            "url": "https://level.tp.st/T6gVHplj",
-            "anchors": ["сравнить туры", "посмотреть варианты тура"],
-        },
-        {
-            "name": "Travelata",
-            "url": "https://travelata.tp.st/O6m2Lg6H",
-            "anchors": ["найти горящий тур", "посмотреть спецпредложения"],
-        },
-    ],
-    "transport": [
-        {
-            "name": "Tutu.ru",
-            "url": "https://tutu.tp.st/dZglLc7q",
-            "anchors": ["посмотреть билеты на поезд или автобус", "сравнить варианты переезда"],
-        },
-        {
-            "name": "Rail Europe",
-            "url": "https://raileurope.tp.st/nWODZ4nI",
-            "anchors": ["подобрать ж/д маршрут по Европе", "посмотреть европейские поезда"],
-        },
-    ],
-    "insurance": [
-        {
-            "name": "TurStrahovka",
-            "url": "https://ektatraveling.tp.st/5dN3sgg2",
-            "anchors": ["оформить страховку", "сравнить полисы для поездки"],
-        },
-        {
-            "name": "Cherehapa",
-            "url": "https://cherehapa.tp.st/RIsddc4I",
-            "anchors": ["проверить страховку", "подобрать страховой полис"],
-        },
-    ],
-    "transfers": [
-        {
-            "name": "KiwiTaxi",
-            "url": "https://kiwitaxi.tp.st/Ven9kvYz",
-            "anchors": ["заказать трансфер", "заранее забронировать поездку из аэропорта"],
-        },
-        {
-            "name": "GetTransfer",
-            "url": "https://gettransfer.tp.st/XelV3vEQ",
-            "anchors": ["посмотреть трансферы", "подобрать трансфер по маршруту"],
-        },
-    ],
-    "car_rental": [
-        {
-            "name": "Qeeq",
-            "url": "https://qeeq.tp.st/b1kQ7KBc",
-            "anchors": ["посмотреть аренду авто", "сравнить прокат машин"],
-        },
-        {
-            "name": "Localrent",
-            "url": "https://localrent.tp.st/Q77W1ZWX",
-            "anchors": ["найти авто у местных компаний", "подобрать машину на месте"],
-        },
-        {
-            "name": "BikesBooking",
-            "url": "https://bikesbooking.tp.st/eMN1TXvi",
-            "anchors": ["взять байк или скутер", "посмотреть аренду двухколёсного транспорта"],
-        },
-    ],
-    "excursions": [
-        {
-            "name": "Tripster",
-            "url": "https://tripster.tp.st/FPqFOATh",
-            "anchors": ["забронировать экскурсию", "посмотреть авторские прогулки"],
-        },
-        {
-            "name": "Sputnik8",
-            "url": "https://sputnik8.tp.st/FQZC0UxF",
-            "anchors": ["найти экскурсии и активности", "посмотреть городские впечатления"],
-        },
-    ],
-    "events": [
-        {
-            "name": "TicketNetwork",
-            "url": "https://ticketnetwork.tp.st/evSOqzXe",
-            "anchors": ["посмотреть билеты на события", "найти концерты и шоу"],
-        },
-        {
-            "name": "Tiqets",
-            "url": "https://tiqets.tp.st/Pe22NnHd",
-            "anchors": ["купить билеты без очереди", "посмотреть музеи и парки"],
-        },
-    ],
-}
-
-CATEGORY_HINTS = {
-    "hotels": ["отел", "гостин", "жиль", "апарт", "ночев", "прожив"],
-    "flights": ["перелет", "авиабил", "рейс", "самолет", "аэропорт"],
-    "lounges": ["лаунж", "бизнес-зал", "бизнес зал", "зал ожидания"],
-    "tours": ["тур", "путев", "все включено", "горящ", "курорт"],
-    "transport": ["поезд", "жд", "автобус", "маршрут", "rail"],
-    "insurance": ["страхов", "полис", "медицина", "безопас"],
-    "transfers": ["трансфер", "такси", "из аэропорта", "до отеля"],
-    "car_rental": ["аренда авто", "машин", "скутер", "байк", "прокат"],
-    "excursions": ["экскурс", "гид", "маршрут", "что посмотреть", "прогулк"],
-    "events": ["событ", "концерт", "музей", "парк", "шоу", "билет"],
-}
-
-TOPIC_POOLS = {
-    "value": [
-        "5 ошибок при планировании отдыха в Турции",
-        "Как сэкономить на поездке в Стамбул без потери впечатлений",
-        "Что проверить перед поездкой в Таиланд",
-        "Где летом комфортно отдыхать недорого",
-        "Как выбрать жильё в популярном туристическом городе",
-        "Что взять с собой в короткое путешествие на 3–4 дня",
-    ],
-    "engagement": [
-        "В какой город Европы вы бы улетели на длинные выходные и почему",
-        "Какой отдых вы выбираете: море, горы или город",
-        "Самая недооценённая страна для короткого отпуска",
-        "Какой ваш главный travel-фейл, который сейчас вспоминается с улыбкой",
-    ],
-    "expert": [
-        "Как выбирать дату вылета, чтобы не переплачивать",
-        "Когда пакетный тур выгоднее самостоятельной поездки",
-        "Когда аренда авто реально оправдана в путешествии",
-        "На чём чаще всего теряют деньги туристы перед поездкой",
-    ],
-    "trust": [
-        "Почему хорошие поездки начинаются не с покупки билета",
-        "Как не испортить отпуск из-за спешки в бронированиях",
-        "Зачем заранее собирать план поездки, даже если любите спонтанность",
-    ],
-    "selling": [
-        "Как найти выгодный тур на ближайшие даты",
-        "Где смотреть перелёт и жильё, если хочется уложиться в бюджет",
-        "Как быстро собрать поездку под ключ без лишней переплаты",
-        "Что проверить перед бронированием экскурсии или трансфера",
-    ],
-    "experimental": [
-        "Нестандартный маршрут выходного дня за пределами популярных направлений",
-        "Мини-гид по городу, который часто недооценивают туристы",
-        "Как превратить обычную поездку в запоминающееся путешествие",
-    ],
-}
-
-LAST_ANCHORS_LIMIT = 5
+scheduler_instance: Optional[AsyncIOScheduler] = None
 
 
-# =========================
-# Database
-# =========================
-def db() -> sqlite3.Connection:
+def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_db() -> None:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            topic TEXT NOT NULL,
-            post_type TEXT NOT NULL,
-            goal TEXT NOT NULL,
-            content TEXT NOT NULL,
-            category TEXT,
-            service_name TEXT,
-            anchor_text TEXT,
-            final_link TEXT,
-            published INTEGER NOT NULL DEFAULT 0,
-            published_at TEXT
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+def init_db():
+    with closing(db()) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS posts(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT,
+                theme_source TEXT,
+                goal TEXT,
+                post_type TEXT,
+                content TEXT NOT NULL,
+                referral_url TEXT,
+                photo_path TEXT,
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_at TEXT NOT NULL,
+                published_at TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings(
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS topics(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic_text TEXT NOT NULL,
+                source_type TEXT DEFAULT 'manual',
+                source_name TEXT DEFAULT '',
+                used INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS partners(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                keywords TEXT NOT NULL,
+                url TEXT NOT NULL,
+                marker TEXT DEFAULT '',
+                is_active INTEGER DEFAULT 1
+            )
+        """)
+
+        conn.commit()
+
+    ensure_default_settings()
+    ensure_default_topics()
+    ensure_default_partners()
 
 
-def save_setting(key: str, value: str) -> None:
-    conn = db()
-    conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, value))
-    conn.commit()
-    conn.close()
+def set_setting(key: str, value: str):
+    with closing(db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO settings(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, value),
+        )
+        conn.commit()
 
 
 def get_setting(key: str, default: str = "") -> str:
-    conn = db()
-    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-    conn.close()
-    return row["value"] if row else default
+    with closing(db()) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
 
 
-def save_post(topic: str, post_type: str, goal: str, content: str, service_meta: dict | None) -> int:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO posts(created_at, topic, post_type, goal, content, category, service_name, anchor_text, final_link)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            datetime.utcnow().isoformat(),
+def ensure_default_settings():
+    defaults = {
+        "autopost_enabled": "1",
+        "post_times": os.getenv("POST_TIMES", "09:00,14:00,19:00"),
+        "default_ref_url": "https://t.me/TourJin_bot",
+        "tourjin_bot_url": "https://t.me/TourJin_bot",
+        "test_channel_id": TEST_CHANNEL_ID,
+        "photo_mode": "local",
+        "topic_mode": "mixed",
+    }
+    for k, v in defaults.items():
+        if get_setting(k, "") == "":
+            set_setting(k, v)
+
+
+def ensure_default_topics():
+    default_topics = [
+        "Как выбрать тур без переплаты",
+        "5 ошибок при бронировании отпуска",
+        "Куда поехать на море недорого",
+        "Семейный отдых: как выбрать комфортный тур",
+        "Когда лучше покупать туры",
+        "Как сэкономить на all inclusive",
+        "Что взять с собой в отпуск",
+        "Как выбрать отель без разочарования",
+        "Короткие путешествия на 3–5 дней",
+        "Лучшие идеи для романтического отдыха",
+        "Отдых с детьми без стресса",
+        "Как проверить тур и не попасть на лишние траты",
+    ]
+    with closing(db()) as conn:
+        count = conn.execute("SELECT COUNT(*) AS c FROM topics").fetchone()["c"]
+        if count == 0:
+            for topic in default_topics:
+                conn.execute(
+                    """
+                    INSERT INTO topics(topic_text, source_type, source_name, used, created_at)
+                    VALUES(?, 'default', 'system', 0, ?)
+                    """,
+                    (topic, now_iso()),
+                )
+            conn.commit()
+
+
+def ensure_default_partners():
+    with closing(db()) as conn:
+        count = conn.execute("SELECT COUNT(*) AS c FROM partners").fetchone()["c"]
+        if count == 0:
+            conn.execute("""
+                INSERT INTO partners(name, keywords, url, marker, is_active)
+                VALUES(?, ?, ?, ?, 1)
+            """, (
+                "TourJin",
+                "тур,туры,путешествие,путешествия,отпуск,отель,отели,перелет,море,пляж,курорт,отдых",
+                "https://t.me/TourJin_bot",
+                "main",
+            ))
+            conn.commit()
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def is_admin(user_id: Optional[int]) -> bool:
+    if TELEGRAM_ADMIN_ID is None:
+        return True
+    return user_id == TELEGRAM_ADMIN_ID
+
+
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id if update.effective_user else None
+        if not is_admin(user_id):
+            await safe_reply(update, "Доступ запрещён.")
+            return
+        return await func(update, context)
+    return wrapper
+
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            ["/gen", "/last", "/schedule"],
+            ["/autopost_on", "/autopost_off", "/test_channel"],
+            ["/topics", "/partners", "/menu"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+async def safe_reply(update: Update, text: str):
+    if update.message:
+        await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+    elif update.effective_chat:
+        await update.get_bot().send_message(
+            chat_id=update.effective_chat.id,
+            text=text,
+            reply_markup=main_menu_keyboard(),
+        )
+
+
+def normalize_text(s: str) -> str:
+    return (s or "").lower().strip()
+
+
+def extract_keywords(text: str) -> List[str]:
+    raw = normalize_text(text)
+    tokens = []
+    for part in raw.replace("\n", " ").replace(",", " ").replace(".", " ").split():
+        part = part.strip()
+        if len(part) >= 3:
+            tokens.append(part)
+    return list(dict.fromkeys(tokens))
+
+
+def choose_referral_url(topic: str, content: str) -> str:
+    combined = f"{topic} {content}".lower()
+
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT name, keywords, url, marker FROM partners WHERE is_active=1 ORDER BY id ASC"
+        ).fetchall()
+
+    best_url = get_setting("default_ref_url", "https://t.me/TourJin_bot")
+    best_score = 0
+
+    for row in rows:
+        keywords = [k.strip().lower() for k in row["keywords"].split(",") if k.strip()]
+        score = sum(1 for kw in keywords if kw in combined)
+        if score > best_score:
+            best_score = score
+            best_url = row["url"]
+
+    return best_url
+
+
+def choose_photo_for_topic(topic: str) -> Optional[Path]:
+    if not PHOTOS_DIR.exists():
+        return None
+
+    topic_lower = normalize_text(topic)
+
+    candidates: List[Path] = []
+    for p in PHOTOS_DIR.rglob("*"):
+        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+            name = p.stem.lower()
+            if any(word in name for word in extract_keywords(topic_lower)):
+                candidates.append(p)
+
+    if candidates:
+        return random.choice(candidates)
+
+    default_dir = PHOTOS_DIR / "default"
+    if default_dir.exists():
+        defaults = [
+            p for p in default_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+        ]
+        if defaults:
+            return random.choice(defaults)
+
+    all_images = [
+        p for p in PHOTOS_DIR.rglob("*")
+        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+    ]
+    return random.choice(all_images) if all_images else None
+
+
+def format_post_text(content: str, referral_url: str) -> str:
+    cta = (
+        "\n\n"
+        "Хочешь подобрать вариант быстрее и без лишней суеты?\n"
+        f"Попробуй: {referral_url}"
+    )
+    return f"{content.strip()}{cta}"
+
+
+def parse_schedule(raw: str) -> List[Tuple[int, int]]:
+    result = []
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    for item in items:
+        hour_str, minute_str = item.split(":")
+        hour = int(hour_str)
+        minute = int(minute_str)
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            raise ValueError(f"Некорректное время: {item}")
+        result.append((hour, minute))
+    if not result:
+        raise ValueError("Пустое расписание")
+    return result
+
+
+def save_post(
+    topic: str,
+    theme_source: str,
+    goal: str,
+    post_type: str,
+    content: str,
+    referral_url: str,
+    photo_path: Optional[str],
+    status: str = "draft",
+) -> int:
+    with closing(db()) as conn:
+        cur = conn.execute("""
+            INSERT INTO posts(
+                topic, theme_source, goal, post_type, content,
+                referral_url, photo_path, status, created_at, published_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
             topic,
-            post_type,
+            theme_source,
             goal,
+            post_type,
             content,
-            service_meta.get("category") if service_meta else None,
-            service_meta.get("name") if service_meta else None,
-            service_meta.get("anchor") if service_meta else None,
-            service_meta.get("final_link") if service_meta else None,
-        ),
-    )
-    post_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return int(post_id)
+            referral_url,
+            photo_path,
+            status,
+            now_iso(),
+            None,
+        ))
+        conn.commit()
+        return cur.lastrowid
 
 
-def mark_published(post_id: int) -> None:
-    conn = db()
-    conn.execute(
-        "UPDATE posts SET published = 1, published_at = ? WHERE id = ?",
-        (datetime.utcnow().isoformat(), post_id),
-    )
-    conn.commit()
-    conn.close()
+def update_post_status(post_id: int, status: str):
+    with closing(db()) as conn:
+        published_at = now_iso() if status == "published" else None
+        conn.execute(
+            "UPDATE posts SET status=?, published_at=COALESCE(?, published_at) WHERE id=?",
+            (status, published_at, post_id),
+        )
+        conn.commit()
 
 
 def get_post(post_id: int):
-    conn = db()
-    row = conn.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone()
-    conn.close()
-    return row
+    with closing(db()) as conn:
+        return conn.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
 
 
 def get_last_post():
-    conn = db()
-    row = conn.execute("SELECT * FROM posts ORDER BY id DESC LIMIT 1").fetchone()
-    conn.close()
-    return row
+    with closing(db()) as conn:
+        return conn.execute("SELECT * FROM posts ORDER BY id DESC LIMIT 1").fetchone()
 
 
-def get_recent_anchors(limit: int = LAST_ANCHORS_LIMIT) -> list[str]:
-    conn = db()
-    rows = conn.execute(
-        "SELECT anchor_text FROM posts WHERE anchor_text IS NOT NULL ORDER BY id DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
-    conn.close()
-    return [r["anchor_text"] for r in rows if r["anchor_text"]]
+def get_next_topic() -> Tuple[str, str]:
+    with closing(db()) as conn:
+        row = conn.execute("""
+            SELECT * FROM topics
+            WHERE used=0
+            ORDER BY id ASC
+            LIMIT 1
+        """).fetchone()
+
+        if row:
+            conn.execute("UPDATE topics SET used=1 WHERE id=?", (row["id"],))
+            conn.commit()
+            return row["topic_text"], row["source_type"]
+
+    fallback = random.choice([
+        "Как выбрать тур без переплаты",
+        "Куда уехать на море недорого",
+        "Как найти хороший отель без ошибок",
+        "Что важно знать перед отпуском",
+        "Как сэкономить на путешествии",
+    ])
+    return fallback, "fallback"
 
 
-# =========================
-# Helpers
-# =========================
-def is_admin(update: Update) -> bool:
-    return bool(update.effective_user and update.effective_user.id == TELEGRAM_ADMIN_ID)
-
-
-def add_marker(url: str, marker: str = DEFAULT_MARKER) -> str:
-    parsed = urlparse(url)
-    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query["marker"] = marker
-    new_query = urlencode(query)
-    return urlunparse(parsed._replace(query=new_query))
-
-
-def choose_post_type() -> str:
-    roll = random.randint(1, 100)
-    if roll <= 35:
-        return "value"
-    if roll <= 55:
-        return "engagement"
-    if roll <= 70:
-        return "expert"
-    if roll <= 80:
-        return "trust"
-    if roll <= 90:
-        return "selling"
-    return "experimental"
-
-
-def choose_goal(post_type: str) -> str:
-    mapping = {
-        "value": "reach",
-        "engagement": "engagement",
-        "expert": "trust",
-        "trust": "trust",
-        "selling": "sale",
-        "experimental": random.choice(["reach", "engagement", "click"]),
-    }
-    return mapping[post_type]
-
-
-def choose_topic(post_type: str) -> str:
-    return random.choice(TOPIC_POOLS[post_type])
-
-
-def detect_category(topic: str, goal: str, post_type: str) -> str | None:
-    text = f"{topic} {goal} {post_type}".lower()
-    scores = {cat: 0 for cat in SERVICES.keys()}
-    for category, hints in CATEGORY_HINTS.items():
-        for hint in hints:
-            if hint in text:
-                scores[category] = scores.get(category, 0) + 1
-    best_cat, best_score = max(scores.items(), key=lambda x: x[1])
-    if best_score > 0:
-        return best_cat
-    if post_type == "selling" or goal in {"sale", "click"}:
-        return random.choice(["tours", "flights", "hotels", "excursions"])
-    return None
-
-
-def choose_service(topic: str, goal: str, post_type: str) -> dict | None:
-    category = detect_category(topic, goal, post_type)
-    if not category:
-        return None
-    candidates = SERVICES.get(category, [])
-    if not candidates:
-        return None
-
-    recent_anchors = set(get_recent_anchors())
-    shuffled = candidates[:]
-    random.shuffle(shuffled)
-
-    for service in shuffled:
-        anchors = [a for a in service["anchors"] if a not in recent_anchors] or service["anchors"]
-        anchor = random.choice(anchors)
-        return {
-            "category": category,
-            "name": service["name"],
-            "url": service["url"],
-            "anchor": anchor,
-            "final_link": add_marker(service["url"]),
-        }
-    return None
-
-
-async def generate_post(topic: str, post_type: str, goal: str) -> tuple[str, dict | None]:
-    service = None
-    if post_type == "selling" or goal in {"sale", "click"}:
-        service = choose_service(topic, goal, post_type)
-    elif post_type in {"value", "expert", "experimental"} and random.random() < 0.35:
-        service = choose_service(topic, goal, post_type)
-    elif post_type in {"engagement", "trust"} and random.random() < 0.15:
-        service = choose_service(topic, goal, post_type)
-
-    monetization_block = "Не добавляй ссылок."
-    if service:
-        monetization_block = (
-            f'Добавь ровно одну HTML-ссылку вида <a href="{html.escape(service["final_link"], quote=True)}">{html.escape(service["anchor"])}</a> '
-            f"в естественную фразу по смыслу. Не упоминай название сервиса {service['name']}. "
-            f"Не пиши, что ссылка партнерская. Ссылка должна смотреться нативно."
-        )
+async def generate_post_via_openai(topic: str) -> str:
+    tourjin_url = get_setting("tourjin_bot_url", "https://t.me/TourJin_bot")
 
     prompt = f"""
-Ты редактор и growth-маркетолог Telegram-канала {CHANNEL_NAME} про путешествия.
-Пиши только на русском языке.
-
-Сделай один готовый Telegram-пост.
+Ты пишешь Telegram-пост для travel-канала "Мир на ладони".
 
 Тема: {topic}
-Тип поста: {post_type}
-Цель: {goal}
 
-Обязательные правила:
-- стиль живой, умный, полезный, уверенный
-- никакого канцелярита
-- никакой шаблонной AI-воды
-- никаких хэштегов
-- длина 900–1400 символов
-- структура: сильный хук -> польза -> конкретика -> мягкий CTA
-- можно 1–2 эмодзи, но умеренно
-- можно нативно упомянуть канал {CHANNEL_NAME}
-- можно упомянуть бота {BOT_NAME}, если это реально уместно
-- НЕ упоминай бренды сервисов бронирования, билетов, экскурсий и т.п.
-- не пиши, что это реклама
-- не используй кликбейт уровня мусорного паблика
-- верни только HTML для Telegram
-- разрешены теги: <b>, <i>, <a>
+Требования:
+- язык: русский
+- стиль: живой, экспертный, доверительный
+- объём: 900–1400 символов
+- без воды и канцелярита
+- без эмодзи-перегруза
+- сделать пост полезным, а не абстрактным
+- в конце мягкий призыв к действию
+- не вставляй markdown-звёздочки
+- не выдумывай цены и факты, если они не даны
+- можно упомянуть помощника для подбора туров: {tourjin_url}
+- текст должен быть оригинальным, не похожим на копипаст
 
-Монетизация:
-{monetization_block}
-
-Верни только готовый HTML-текст поста. Без пояснений.
-"""
+Структура:
+1. сильный заход
+2. польза/советы
+3. короткий вывод
+4. мягкий CTA
+""".strip()
 
     response = await client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model="gpt-4o-mini",
         temperature=0.9,
         messages=[
-            {"role": "system", "content": "Ты сильный редактор Telegram и travel-копирайтер."},
+            {"role": "system", "content": "Ты сильный редактор travel-контента для Telegram."},
             {"role": "user", "content": prompt},
         ],
     )
-    text = (response.choices[0].message.content or "").strip()
-    return text, service
+
+    text = response.choices[0].message.content or ""
+    text = text.strip()
+    if not text:
+        raise ValueError("OpenAI вернул пустой текст")
+    return text
 
 
-async def autopost_job(app: Application) -> None:
-    post_type = choose_post_type()
-    goal = choose_goal(post_type)
-    topic = choose_topic(post_type)
-    logger.info("Autopost started | type=%s | goal=%s | topic=%s", post_type, goal, topic)
+async def generate_post_with_retry(topic: str, retries: int = 3, delay: int = 4) -> str:
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return await generate_post_via_openai(topic)
+        except Exception as e:
+            last_error = e
+            logger.exception("Ошибка генерации поста | topic=%s | attempt=%s/%s", topic, attempt, retries)
+            if attempt < retries:
+                await asyncio.sleep(delay)
+    raise last_error
 
-    content, service = await generate_post(topic, post_type, goal)
-    post_id = save_post(topic, post_type, goal, content, service)
 
-    await app.bot.send_message(
-        chat_id=TELEGRAM_CHANNEL_ID,
-        text=content,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
+async def publish_post_record(bot, channel_id: str, row, mark_status: str = "published"):
+    text = format_post_text(row["content"], row["referral_url"] or get_setting("default_ref_url"))
+
+    photo_path = row["photo_path"]
+    if photo_path and Path(photo_path).exists():
+        with open(photo_path, "rb") as f:
+            await bot.send_photo(chat_id=channel_id, photo=f, caption=text[:1024])
+    else:
+        await bot.send_message(chat_id=channel_id, text=text)
+
+    update_post_status(row["id"], mark_status)
+
+
+def format_post_card(row) -> str:
+    if not row:
+        return "Постов пока нет."
+
+    return (
+        f"ID: {row['id']}\n"
+        f"Тема: {row['topic'] or '-'}\n"
+        f"Источник темы: {row['theme_source'] or '-'}\n"
+        f"Тип: {row['post_type'] or '-'}\n"
+        f"Цель: {row['goal'] or '-'}\n"
+        f"Канал: {TELEGRAM_CHANNEL_ID}\n"
+        f"Опубликован: {'да' if row['status'] == 'published' else 'нет'}\n"
+        f"Реф-ссылка: {row['referral_url'] or '-'}\n\n"
+        f"{row['content']}"
     )
-    mark_published(post_id)
-    logger.info("Autopost published | post_id=%s", post_id)
-
-    try:
-        await app.bot.send_message(
-            chat_id=TELEGRAM_ADMIN_ID,
-            text=f"Автопост опубликован.\nID: {post_id}\nТема: {topic}\nТип: {post_type}",
-        )
-    except Exception as exc:
-        logger.warning("Cannot notify admin: %s", exc)
 
 
-# =========================
-# Telegram commands
-# =========================
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        await update.message.reply_text("Доступ только для администратора.")
+def rebuild_scheduler(app: Application):
+    global scheduler_instance
+
+    if scheduler_instance:
+        try:
+            scheduler_instance.remove_all_jobs()
+            scheduler_instance.shutdown(wait=False)
+        except Exception:
+            logger.exception("Не удалось корректно остановить старый scheduler")
+
+    scheduler_instance = AsyncIOScheduler(timezone="Europe/Berlin")
+
+    autopost_enabled = get_setting("autopost_enabled", "1") == "1"
+    schedule_raw = get_setting("post_times", "09:00,14:00,19:00")
+
+    if autopost_enabled:
+        for hour, minute in parse_schedule(schedule_raw):
+            scheduler_instance.add_job(
+                scheduled_autopost_job,
+                "cron",
+                hour=hour,
+                minute=minute,
+                args=[app],
+                id=f"autopost_{hour:02d}_{minute:02d}",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+
+    scheduler_instance.start()
+    logger.info("Scheduler rebuilt | enabled=%s | times=%s", autopost_enabled, schedule_raw)
+
+
+async def scheduled_autopost_job(app: Application):
+    if get_setting("autopost_enabled", "1") != "1":
+        logger.info("Автопостинг отключён, задача пропущена")
         return
-    await update.message.reply_text(
-        "Бот запущен.\n\n"
+
+    topic, source_type = get_next_topic()
+    content = await generate_post_with_retry(topic)
+    referral_url = choose_referral_url(topic, content)
+    photo_path = choose_photo_for_topic(topic)
+    post_id = save_post(
+        topic=topic,
+        theme_source=source_type,
+        goal="trust",
+        post_type="auto",
+        content=content,
+        referral_url=referral_url,
+        photo_path=str(photo_path) if photo_path else None,
+        status="draft",
+    )
+    row = get_post(post_id)
+    await publish_post_record(app.bot, TELEGRAM_CHANNEL_ID, row, mark_status="published")
+    logger.info("Автопост опубликован | id=%s | topic=%s", post_id, topic)
+
+
+@admin_only
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_reply(
+        update,
+        "Бот работает.\n\n"
+        "Главные команды:\n"
         "/gen [тема] — сгенерировать пост\n"
-        "/publish [id] — опубликовать пост вручную\n"
-        "/last — показать последний пост\n"
+        "/publish [id] — опубликовать пост\n"
+        "/last — последний пост\n"
         "/schedule — показать расписание\n"
+        "/set_schedule 09:00,14:00,19:00 — поменять расписание\n"
         "/autopost_on — включить автопостинг\n"
         "/autopost_off — выключить автопостинг\n"
-        "/test_channel — тест публикации в канал"
+        "/test_channel — тестовый пост в тестовый канал\n"
+        "/test_post [id] — тест конкретного поста\n"
+        "/topic_add текст — добавить тему\n"
+        "/topics — показать темы\n"
+        "/partners — показать партнёрские ссылки\n"
+        "/partner_add name | keywords | url — добавить партнёрскую ссылку\n"
+        "/set_tourjin https://t.me/TourJin_bot — обновить ссылку"
     )
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+@admin_only
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_cmd(update, context)
 
 
-async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        await update.message.reply_text("Доступ только для администратора.")
-        return
+@admin_only
+async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    topic = " ".join(context.args).strip() if context.args else ""
 
-    topic = " ".join(context.args).strip() or choose_topic("selling")
-    post_type = choose_post_type()
-    goal = choose_goal(post_type)
+    if not topic:
+        topic, source_type = get_next_topic()
+    else:
+        source_type = "manual"
 
-    await update.message.reply_text("Генерирую пост...")
-    content, service = await generate_post(topic, post_type, goal)
-    post_id = save_post(topic, post_type, goal, content, service)
+    await safe_reply(update, f"Генерирую пост по теме: {topic}")
 
-    meta = [f"ID: {post_id}", f"Тип: {post_type}", f"Цель: {goal}"]
-    if service:
-        meta.append(f"Категория: {service['category']}")
-        meta.append(f"Сервис: {service['name']} (внутренне)")
+    content = await generate_post_with_retry(topic)
+    referral_url = choose_referral_url(topic, content)
+    photo_path = choose_photo_for_topic(topic)
 
-    await update.message.reply_text(
-        "\n".join(meta),
-        disable_web_page_preview=True,
-    )
-    await update.message.reply_text(
-        content[:3900],
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
+    post_id = save_post(
+        topic=topic,
+        theme_source=source_type,
+        goal="trust",
+        post_type="expert",
+        content=content,
+        referral_url=referral_url,
+        photo_path=str(photo_path) if photo_path else None,
+        status="draft",
     )
 
-
-async def publish_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        await update.message.reply_text("Доступ только для администратора.")
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Пример: /publish 12")
-        return
-
-    post = get_post(int(context.args[0]))
-    if not post:
-        await update.message.reply_text("Пост не найден.")
-        return
-
-    await context.bot.send_message(
-        chat_id=TELEGRAM_CHANNEL_ID,
-        text=post["content"],
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
+    row = get_post(post_id)
+    msg = (
+        f"Пост создан.\n\n"
+        f"{format_post_card(row)}\n\n"
+        f"Для публикации: /publish {post_id}\n"
+        f"Для теста: /test_post {post_id}"
     )
-    mark_published(post["id"])
-    await update.message.reply_text(f"Пост {post['id']} опубликован в канал.")
+    await safe_reply(update, msg)
 
 
-async def last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        await update.message.reply_text("Доступ только для администратора.")
+@admin_only
+async def publish_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await safe_reply(update, "Пример: /publish 12")
         return
 
-    post = get_last_post()
-    if not post:
-        await update.message.reply_text("Постов пока нет.")
+    post_id = int(context.args[0])
+    row = get_post(post_id)
+
+    if not row:
+        await safe_reply(update, f"Пост с ID {post_id} не найден.")
         return
 
-    await update.message.reply_text(
-        f"ID: {post['id']}\nОпубликован: {'да' if post['published'] else 'нет'}",
-    )
-    await update.message.reply_text(
-        post["content"][:3900],
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
+    await publish_post_record(context.bot, TELEGRAM_CHANNEL_ID, row, mark_status="published")
+    await safe_reply(update, f"Пост {post_id} опубликован.")
+
+
+@admin_only
+async def last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    row = get_last_post()
+    await safe_reply(update, format_post_card(row))
+
+
+@admin_only
+async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    enabled = "включен" if get_setting("autopost_enabled", "1") == "1" else "выключен"
+    schedule_raw = get_setting("post_times", "09:00,14:00,19:00")
+    await safe_reply(
+        update,
+        f"Автопостинг: {enabled}\nВремя публикаций: {schedule_raw}\n\n"
+        f"Изменить: /set_schedule 09:00,14:00,19:00"
     )
 
 
-async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        await update.message.reply_text("Доступ только для администратора.")
+@admin_only
+async def set_schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = " ".join(context.args).strip()
+    if not raw:
+        await safe_reply(update, "Пример: /set_schedule 08:30,13:00,18:45")
         return
 
-    status = get_setting("autopost_enabled", "true")
-    await update.message.reply_text(
-        f"Автопостинг: {'включен' if status == 'true' else 'выключен'}\n"
-        f"Время публикаций: {POST_TIMES}\n"
-        f"Канал: {TELEGRAM_CHANNEL_ID}"
-    )
+    parse_schedule(raw)
+    set_setting("post_times", raw)
+    rebuild_scheduler(context.application)
+    await safe_reply(update, f"Расписание обновлено: {raw}")
 
 
-async def autopost_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        await update.message.reply_text("Доступ только для администратора.")
+@admin_only
+async def autopost_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_setting("autopost_enabled", "1")
+    rebuild_scheduler(context.application)
+    await safe_reply(update, "Автопостинг включен.")
+
+
+@admin_only
+async def autopost_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_setting("autopost_enabled", "0")
+    rebuild_scheduler(context.application)
+    await safe_reply(update, "Автопостинг выключен.")
+
+
+@admin_only
+async def test_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    test_channel_id = get_setting("test_channel_id", TEST_CHANNEL_ID).strip()
+    if not test_channel_id:
+        await safe_reply(update, "Не задан TEST_CHANNEL_ID или test_channel_id в настройках.")
         return
-    save_setting("autopost_enabled", "true")
-    await update.message.reply_text("Автопостинг включен.")
 
+    row = get_last_post()
+    if not row:
+        topic = "Тестовый пост для проверки канала"
+        content = await generate_post_with_retry(topic)
+        referral_url = choose_referral_url(topic, content)
+        photo_path = choose_photo_for_topic(topic)
 
-async def autopost_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        await update.message.reply_text("Доступ только для администратора.")
-        return
-    save_setting("autopost_enabled", "false")
-    await update.message.reply_text("Автопостинг выключен.")
+        post_id = save_post(
+            topic=topic,
+            theme_source="test",
+            goal="test",
+            post_type="test",
+            content=content,
+            referral_url=referral_url,
+            photo_path=str(photo_path) if photo_path else None,
+            status="draft",
+        )
+        row = get_post(post_id)
 
-
-async def test_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        await update.message.reply_text("Доступ только для администратора.")
-        return
-    await context.bot.send_message(
-        chat_id=TELEGRAM_CHANNEL_ID,
-        text="Тест публикации от бота МирНаЛадони ✅",
-    )
-    await update.message.reply_text("Тест отправлен в канал.")
-
-
-# =========================
-# Scheduler
-# =========================
-def create_scheduler(app: Application) -> AsyncIOScheduler:
-    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
-
-    for time_str in [t.strip() for t in POST_TIMES.split(",") if t.strip()]:
-        hour, minute = time_str.split(":")
-
-        async def job_wrapper(application: Application = app):
-            enabled = get_setting("autopost_enabled", "true" if AUTOPOST_ENABLED else "false")
-            if enabled != "true":
-                logger.info("Autopost skipped: disabled")
-                return
-            try:
-                await autopost_job(application)
-            except Exception as exc:
-                logger.exception("Autopost failed: %s", exc)
-                try:
-                    await application.bot.send_message(
-                        chat_id=TELEGRAM_ADMIN_ID,
-                        text=f"Ошибка автопостинга: {exc}",
-                    )
-                except Exception:
-                    pass
-
-        scheduler.add_job(
-            job_wrapper,
-            "cron",
-            hour=int(hour),
-            minute=int(minute),
-            misfire_grace_time=300,
-            id=f"autopost_{hour}_{minute}",
-            replace_existing=True,
+    try:
+        await publish_post_record(context.bot, test_channel_id, row, mark_status="tested")
+        await safe_reply(update, f"Тестовая публикация отправлена в {test_channel_id}.")
+    except Forbidden:
+        await safe_reply(
+            update,
+            "Не удалось отправить в тестовый канал: бот не состоит в канале или у него нет прав публикации."
         )
 
-    return scheduler
+
+@admin_only
+async def test_post_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await safe_reply(update, "Пример: /test_post 12")
+        return
+
+    post_id = int(context.args[0])
+    row = get_post(post_id)
+    if not row:
+        await safe_reply(update, f"Пост с ID {post_id} не найден.")
+        return
+
+    test_channel_id = get_setting("test_channel_id", TEST_CHANNEL_ID).strip()
+    if not test_channel_id:
+        await safe_reply(update, "Не задан тестовый канал.")
+        return
+
+    try:
+        await publish_post_record(context.bot, test_channel_id, row, mark_status="tested")
+        await safe_reply(update, f"Пост {post_id} отправлен в тестовый канал.")
+    except Forbidden:
+        await safe_reply(
+            update,
+            "Бот не может публиковать в тестовый канал. Проверьте членство и права."
+        )
 
 
-async def post_init(app: Application) -> None:
-    init_db()
+@admin_only
+async def topics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT id, topic_text, source_type, used FROM topics ORDER BY id DESC LIMIT 10"
+        ).fetchall()
 
-    if get_setting("autopost_enabled", "") == "":
-        save_setting("autopost_enabled", "true" if AUTOPOST_ENABLED else "false")
+    if not rows:
+        await safe_reply(update, "Тем пока нет.")
+        return
 
-    scheduler = create_scheduler(app)
-    scheduler.start()
-    app.bot_data["scheduler"] = scheduler
-    logger.info("Scheduler started | times=%s", POST_TIMES)
-
-
-async def post_shutdown(app: Application) -> None:
-    scheduler = app.bot_data.get("scheduler")
-    if scheduler:
-        scheduler.shutdown(wait=False)
-        logger.info("Scheduler stopped")
+    text = "Последние темы:\n\n"
+    for row in rows:
+        text += (
+            f"{row['id']}. {row['topic_text']} | "
+            f"источник={row['source_type']} | used={row['used']}\n"
+        )
+    text += "\nДобавить: /topic_add Ваша тема"
+    await safe_reply(update, text)
 
 
-def main() -> None:
-    init_db()
-    logger.info("Bot starting...")
+@admin_only
+async def topic_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    topic = " ".join(context.args).strip()
+    if not topic:
+        await safe_reply(update, "Пример: /topic_add Как выбрать тур в Турцию летом")
+        return
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
+    with closing(db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO topics(topic_text, source_type, source_name, used, created_at)
+            VALUES (?, 'manual', 'admin', 0, ?)
+            """,
+            (topic, now_iso()),
+        )
+        conn.commit()
+
+    await safe_reply(update, f"Тема добавлена: {topic}")
+
+
+@admin_only
+async def partners_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT id, name, keywords, url, marker, is_active FROM partners ORDER BY id DESC"
+        ).fetchall()
+
+    if not rows:
+        await safe_reply(update, "Партнёрских ссылок пока нет.")
+        return
+
+    text = "Партнёрские ссылки:\n\n"
+    for row in rows:
+        text += (
+            f"{row['id']}. {row['name']}\n"
+            f"keywords: {row['keywords']}\n"
+            f"url: {row['url']}\n"
+            f"marker: {row['marker']}\n"
+            f"active: {row['is_active']}\n\n"
+        )
+    text += "Добавить: /partner_add name | keywords | url"
+    await safe_reply(update, text)
+
+
+@admin_only
+async def partner_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.replace("/partner_add", "", 1).strip()
+    parts = [p.strip() for p in raw.split("|")]
+
+    if len(parts) < 3:
+        await safe_reply(update, "Пример: /partner_add TourJin | тур,отпуск,отель | https://t.me/TourJin_bot")
+        return
+
+    name, keywords, url = parts[0], parts[1], parts[2]
+
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO partners(name, keywords, url, marker, is_active)
+            VALUES (?, ?, ?, '', 1)
+        """, (name, keywords, url))
+        conn.commit()
+
+    await safe_reply(update, f"Партнёрская ссылка добавлена: {name}")
+
+
+@admin_only
+async def set_tourjin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await safe_reply(update, "Пример: /set_tourjin https://t.me/TourJin_bot")
+        return
+
+    url = context.args[0].strip()
+    set_setting("tourjin_bot_url", url)
+    set_setting("default_ref_url", url)
+    await safe_reply(update, f"Ссылка TourJin обновлена: {url}")
+
+
+@admin_only
+async def set_test_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await safe_reply(update, "Пример: /set_test_channel @my_test_channel")
+        return
+
+    channel = context.args[0].strip()
+    set_setting("test_channel_id", channel)
+    await safe_reply(update, f"Тестовый канал обновлён: {channel}")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception", exc_info=context.error)
+
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Произошла ошибка. Она записана в логи. Меню возвращено.",
+                reply_markup=main_menu_keyboard(),
+            )
+        except Exception:
+            logger.exception("Не удалось отправить сообщение об ошибке пользователю")
+
+
+def build_application() -> Application:
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("gen", gen_cmd))
     app.add_handler(CommandHandler("publish", publish_cmd))
     app.add_handler(CommandHandler("last", last_cmd))
     app.add_handler(CommandHandler("schedule", schedule_cmd))
+    app.add_handler(CommandHandler("set_schedule", set_schedule_cmd))
     app.add_handler(CommandHandler("autopost_on", autopost_on_cmd))
     app.add_handler(CommandHandler("autopost_off", autopost_off_cmd))
     app.add_handler(CommandHandler("test_channel", test_channel_cmd))
+    app.add_handler(CommandHandler("test_post", test_post_cmd))
+    app.add_handler(CommandHandler("topics", topics_cmd))
+    app.add_handler(CommandHandler("topic_add", topic_add_cmd))
+    app.add_handler(CommandHandler("partners", partners_cmd))
+    app.add_handler(CommandHandler("partner_add", partner_add_cmd))
+    app.add_handler(CommandHandler("set_tourjin", set_tourjin_cmd))
+    app.add_handler(CommandHandler("set_test_channel", set_test_channel_cmd))
 
-    app.run_polling()
+    app.add_error_handler(error_handler)
+    return app
+
+
+def main():
+    init_db()
+    app = build_application()
+    rebuild_scheduler(app)
+    logger.info("Bot starting...")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
