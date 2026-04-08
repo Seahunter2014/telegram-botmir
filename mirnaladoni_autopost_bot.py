@@ -54,7 +54,7 @@ SERVICES = {
     "hotels": [
         {
             "name": "Островок",
-            "url": "url": "https://ostrovok.tp.st/yHBoZUg7",
+            "url": "https://ostrovok.tp.st/yHBoZUg7",
             "anchors": ["подобрать жильё", "посмотреть варианты проживания"],
         },
         {
