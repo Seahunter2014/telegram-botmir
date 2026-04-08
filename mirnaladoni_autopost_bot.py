@@ -5,7 +5,7 @@ import random
 import re
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -634,7 +634,9 @@ def rebuild_scheduler(app: Application):
         except Exception:
             logger.exception("Не удалось корректно остановить старый scheduler")
 
-    scheduler_instance = AsyncIOScheduler(timezone="Europe/Berlin")
+    scheduler_instance = AsyncIOScheduler(
+    timezone=timezone(timedelta(hours=3))
+)
 
     autopost_enabled = get_setting("autopost_enabled", "1") == "1"
     schedule_raw = get_setting("post_times", DEFAULT_POST_TIMES or "09:00,14:00,19:00")
