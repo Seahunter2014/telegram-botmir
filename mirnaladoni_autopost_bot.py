@@ -27,6 +27,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
 DEFAULT_POST_TIMES = os.getenv("POST_TIMES", "09:00,14:00,19:00").strip()
 
+# Фиксированное время UTC+3, независимо от сервера/VPN
+BOT_TZ = timezone(timedelta(hours=3))
+
 TELEGRAM_ADMIN_ID = int(TELEGRAM_ADMIN_ID_RAW) if TELEGRAM_ADMIN_ID_RAW else None
 
 if not TELEGRAM_BOT_TOKEN:
@@ -158,7 +161,7 @@ def ensure_default_settings():
         "pexels_orientation": "landscape",
         "pexels_size": "large",
         "pexels_per_page": "10",
-        "photo_attribution_mode": "1",
+        "photo_attribution_mode": "0",  # можно включить 1, если захотите показывать credit
     }
     for key, value in defaults.items():
         if get_setting(key, "") == "":
@@ -265,7 +268,7 @@ def choose_referral_url(topic: str, content: str) -> str:
 
     with closing(db()) as conn:
         rows = conn.execute(
-            "SELECT name, keywords, url, marker FROM partners WHERE is_active=1 ORDER BY id ASC"
+            "SELECT name, keywords, url FROM partners WHERE is_active=1 ORDER BY id ASC"
         ).fetchall()
 
     best_url = get_setting("default_ref_url", "https://t.me/TourJin_bot")
@@ -372,21 +375,120 @@ async def fetch_pexels_photo(topic: str) -> Tuple[Optional[str], Optional[str], 
     return None, None, None
 
 
-def format_post_text(content: str, referral_url: str, photo_credit: Optional[str], photo_source_url: Optional[str]) -> str:
-    parts = [
-        content.strip(),
-        "",
-        "Хочешь подобрать вариант быстрее и без лишней суеты?",
-        f"Попробуй: {referral_url}",
+def cleanup_post_text(text: str) -> str:
+    text = text.replace("***", "").replace("**", "").replace("__", "")
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    text = re.sub(r"[ \t]+", " ", text)
+
+    broken_endings = ["осн", "под", "пер", "отд", "тур", "поезд", "путеш", "основан", "наиб", "предлож"]
+    for ending in broken_endings:
+        if text.lower().endswith(ending):
+            text = text[:-len(ending)].rstrip(" ,.-:;")
+
+    return text.strip()
+
+
+def looks_incomplete(text: str) -> bool:
+    stripped = text.strip()
+
+    if len(stripped) < 500:
+        return True
+
+    if stripped.endswith((":", ",", ";", "—", "-", "…")):
+        return True
+
+    last_line = stripped.splitlines()[-1].strip()
+    if stripped and stripped[-1].isalnum() and len(last_line.split()) <= 2:
+        return True
+
+    return False
+
+
+def trim_to_limit(text: str, max_len: int) -> str:
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+
+    shortened = text[:max_len].rstrip()
+    last_break = max(
+        shortened.rfind("\n"),
+        shortened.rfind(". "),
+        shortened.rfind("! "),
+        shortened.rfind("? "),
+    )
+
+    if last_break > max_len * 0.6:
+        shortened = shortened[:last_break + 1].rstrip()
+
+    return shortened.rstrip(" ,;:-") + "…"
+
+
+def choose_post_ending(topic: str, referral_url: str) -> str:
+    topic_lower = normalize_text(topic)
+
+    sales_keywords = [
+        "тур", "туры", "отель", "отдых", "море", "пляж", "курорт",
+        "путешествие", "путешествия", "отпуск", "перелет", "all inclusive"
     ]
 
-    if get_setting("photo_attribution_mode", "1") == "1" and photo_credit:
-        if photo_source_url:
-            parts.extend(["", f"{photo_credit}", f"{photo_source_url}"])
-        else:
-            parts.extend(["", photo_credit])
+    neutral_keywords = [
+        "лайфхак", "совет", "ошибка", "чек", "список", "что взять",
+        "как выбрать", "как проверить"
+    ]
 
-    return "\n".join(parts).strip()
+    sales_match = any(word in topic_lower for word in sales_keywords)
+    neutral_match = any(word in topic_lower for word in neutral_keywords)
+
+    sales_endings = [
+        f"Если хочешь упростить выбор поездки, загляни сюда 👇\n{referral_url}\n\nПодпишись на канал, поставь ❤️ и поделись постом с друзьями ✈️",
+        f"Для удобного поиска вариантов можно использовать бота 👇\n{referral_url}\n\nНапиши в комментариях своё мнение и отправь пост друзьям 🌍",
+        f"Сохрани пост, чтобы не потерять.\nА если захочешь посмотреть варианты поездки — вот бот 👇\n{referral_url}\n\nИ не забудь поставить ❤️",
+    ]
+
+    mixed_endings = [
+        f"Подпишись на канал — здесь только полезные travel-разборы ✈️\n\nЕсли тема уже актуальна для тебя, можно посмотреть варианты тут:\n{referral_url}",
+        f"Сохрани пост, поставь ❤️ и поделись с друзьями.\n\nА для удобного поиска вариантов есть бот 👇\n{referral_url}",
+    ]
+
+    neutral_endings = [
+        "Подписывайся на канал, если любишь практичные советы для путешествий ✈️\n\nПоставь ❤️ и поделись постом с друзьями.",
+        "Сохрани пост, чтобы не потерять, и поделись с друзьями 🌍\n\nА в комментариях напиши своё мнение или опыт.",
+        "Если было полезно — подпишись на канал 💙\n\nПоставь ❤️ и напиши в комментариях, как у тебя было на практике.",
+    ]
+
+    if sales_match:
+        return random.choice(sales_endings)
+    if neutral_match:
+        return random.choice(mixed_endings)
+    return random.choice(neutral_endings)
+
+
+def format_post_text(
+    content: str,
+    referral_url: str,
+    photo_credit: Optional[str],
+    photo_source_url: Optional[str],
+    topic: str,
+) -> str:
+    ending = choose_post_ending(topic, referral_url)
+
+    credit_block = ""
+    if get_setting("photo_attribution_mode", "0") == "1" and photo_credit:
+        credit_block = f"\n\n{photo_credit}"
+        if photo_source_url:
+            credit_block += f"\n{photo_source_url}"
+
+    base_limit = 1024 - len(ending) - len(credit_block) - 4
+    clean_content = trim_to_limit(content, max(520, base_limit))
+
+    final_text = f"{clean_content}\n\n{ending}{credit_block}".strip()
+
+    if len(final_text) > 1024:
+        overflow = len(final_text) - 1024
+        clean_content = trim_to_limit(clean_content, max(400, len(clean_content) - overflow - 10))
+        final_text = f"{clean_content}\n\n{ending}{credit_block}".strip()
+
+    return final_text[:1024].strip()
 
 
 def parse_schedule(raw: str) -> List[Tuple[int, int]]:
@@ -489,34 +591,44 @@ async def generate_post_via_openai(topic: str) -> str:
     tourjin_url = get_setting("tourjin_bot_url", "https://t.me/TourJin_bot")
 
     prompt = f"""
-Ты пишешь Telegram-пост для travel-канала "Мир на ладони".
+Ты пишешь Telegram-пост для travel-канала «Мир на ладони».
 
 Тема: {topic}
 
-Требования:
+Жёсткие требования:
 - язык: русский
-- стиль: живой, экспертный, доверительный
-- объём: 900–1400 символов
-- без воды и канцелярита
-- без перегруза эмодзи
-- пост должен быть полезным
-- не используй markdown-символы для оформления
-- не выдумывай точные цены и факты
-- можно упомянуть помощника для подбора туров: {tourjin_url}
+- стиль: живой, экспертный, дружелюбный
+- текст должен легко читаться с телефона
+- основной текст: строго 700–900 символов
+- итоговый пост после добавления концовки должен быть не длиннее 1024 символов
+- обязательно делай абзацы
+- не делай сплошное полотно текста
+- используй 2–5 уместных эмодзи
+- можно использовать короткие акценты и мини-подзаголовки
+- не используй markdown со звёздочками
+- не пиши слишком длинные предложения
+- не выдумывай факты, цены и обещания
+- текст должен быть законченным, без обрыва
 - текст должен быть оригинальным
+- можно мягко подвести к боту {tourjin_url}, если тема подходит
+- не делай призывов поручить нам индивидуальный подбор
+- не вставляй ссылку в основной текст
+- не пиши пояснений для редактора
+- верни только готовый текст поста
 
 Структура:
-1. сильный заход
-2. польза или советы
-3. короткий вывод
-4. мягкий CTA
+1. короткий заголовок с эмодзи
+2. заход 1–2 предложения
+3. 2–4 коротких абзаца с пользой
+4. короткий вывод
 """.strip()
 
     response = await client.chat.completions.create(
         model="gpt-4o-mini",
-        temperature=0.9,
+        temperature=0.8,
+        max_tokens=900,
         messages=[
-            {"role": "system", "content": "Ты сильный редактор travel-контента для Telegram."},
+            {"role": "system", "content": "Ты сильный редактор Telegram-постов про путешествия."},
             {"role": "user", "content": prompt},
         ],
     )
@@ -524,14 +636,22 @@ async def generate_post_via_openai(topic: str) -> str:
     text = (response.choices[0].message.content or "").strip()
     if not text:
         raise ValueError("OpenAI вернул пустой текст")
-    return text
+
+    return cleanup_post_text(text)
 
 
 async def generate_post_with_retry(topic: str, retries: int = 3, delay: int = 4) -> str:
     last_error = None
+
     for attempt in range(1, retries + 1):
         try:
-            return await generate_post_via_openai(topic)
+            text = await generate_post_via_openai(topic)
+
+            if looks_incomplete(text):
+                raise ValueError("Сгенерированный текст выглядит незавершённым")
+
+            return text
+
         except Exception as exc:
             last_error = exc
             logger.exception(
@@ -572,6 +692,7 @@ async def publish_post_record(bot, channel_id: str, row, mark_status: str = "pub
         row["referral_url"] or get_setting("default_ref_url", "https://t.me/TourJin_bot"),
         row["photo_credit"],
         row["photo_source_url"],
+        row["topic"] or "",
     )
 
     photo_path = row["photo_path"]
@@ -599,7 +720,7 @@ def format_post_card(row) -> str:
         f"Тип: {row['post_type'] or '-'}\n"
         f"Цель: {row['goal'] or '-'}\n"
         f"Канал: {TELEGRAM_CHANNEL_ID}\n"
-        f"Опубликован: {'да' if row['status'] == 'published' else 'нет'}\n"
+        f"Статус: {row['status']}\n"
         f"Реф-ссылка: {row['referral_url'] or '-'}\n"
         f"Фото: {'да' if row['photo_path'] else 'нет'}\n\n"
         f"{row['content']}"
@@ -610,6 +731,8 @@ async def scheduled_autopost_job(app: Application):
     if get_setting("autopost_enabled", "1") != "1":
         logger.info("Автопостинг отключён, задача пропущена")
         return
+
+    logger.info("Запуск scheduled_autopost_job")
 
     topic, source_type = get_next_topic()
     post_id = await create_post_record(
@@ -626,20 +749,14 @@ async def scheduled_autopost_job(app: Application):
 def rebuild_scheduler(app: Application):
     global scheduler_instance
 
-    if scheduler_instance:
-        try:
-            if scheduler_instance.running:
-                scheduler_instance.remove_all_jobs()
-                scheduler_instance.shutdown(wait=False)
-        except Exception:
-            logger.exception("Не удалось корректно остановить старый scheduler")
-
-    scheduler_instance = AsyncIOScheduler(
-    timezone=timezone(timedelta(hours=3))
-)
-
-    autopost_enabled = get_setting("autopost_enabled", "1") == "1"
     schedule_raw = get_setting("post_times", DEFAULT_POST_TIMES or "09:00,14:00,19:00")
+    autopost_enabled = get_setting("autopost_enabled", "1") == "1"
+
+    if scheduler_instance is None:
+        scheduler_instance = AsyncIOScheduler(timezone=BOT_TZ)
+
+    if scheduler_instance.running:
+        scheduler_instance.remove_all_jobs()
 
     if autopost_enabled:
         for hour, minute in parse_schedule(schedule_raw):
@@ -655,7 +772,9 @@ def rebuild_scheduler(app: Application):
                 coalesce=True,
             )
 
-    scheduler_instance.start()
+    if not scheduler_instance.running:
+        scheduler_instance.start()
+
     logger.info("Scheduler rebuilt | enabled=%s | times=%s", autopost_enabled, schedule_raw)
 
 
@@ -697,6 +816,7 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         source_type = "manual"
 
     await safe_reply(update, f"Генерирую пост по теме: {topic}")
+
     post_id = await create_post_record(
         topic=topic,
         source_type=source_type,
@@ -747,7 +867,7 @@ async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(
         update,
         f"Автопостинг: {enabled}\n"
-        f"Время публикаций: {schedule_raw}\n\n"
+        f"Время публикаций (UTC+3): {schedule_raw}\n\n"
         f"Изменить: /set_schedule 08:30,13:00,18:45"
     )
 
@@ -767,7 +887,7 @@ async def set_schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     set_setting("post_times", raw)
     rebuild_scheduler(context.application)
-    await safe_reply(update, f"Расписание обновлено: {raw}")
+    await safe_reply(update, f"Расписание обновлено (UTC+3): {raw}")
 
 
 @admin_only
