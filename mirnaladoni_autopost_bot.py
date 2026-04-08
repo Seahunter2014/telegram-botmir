@@ -673,27 +673,17 @@ async def post_init(app: Application) -> None:
     logger.info("Scheduler started | times=%s", POST_TIMES)
 
 
-async def main() -> None:
+def main() -> None:
     init_db()
-    application = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    application.add_handler(CommandHandler("start", start_cmd))
-    application.add_handler(CommandHandler("gen", gen_cmd))
-    application.add_handler(CommandHandler("publish", publish_cmd))
-    application.add_handler(CommandHandler("last", last_cmd))
-    application.add_handler(CommandHandler("schedule", schedule_cmd))
-    application.add_handler(CommandHandler("autopost_on", autopost_on_cmd))
-    application.add_handler(CommandHandler("autopost_off", autopost_off_cmd))
-    application.add_handler(CommandHandler("test_channel", test_channel_cmd))
-
-    logger.info("Bot starting...")
-    await application.run_polling(close_loop=False)
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("gen", gen_cmd))
+    app.add_handler(CommandHandler("publish", publish_cmd))
+    app.add_handler(CommandHandler("last", last_cmd))
+    print("Bot is running...")
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
