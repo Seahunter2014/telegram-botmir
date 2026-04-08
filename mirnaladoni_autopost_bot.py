@@ -2,12 +2,14 @@ import asyncio
 import logging
 import os
 import random
+import re
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Tuple
 
+import httpx
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -22,6 +24,8 @@ TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 TEST_CHANNEL_ID = os.getenv("TEST_CHANNEL_ID", "").strip()
 TELEGRAM_ADMIN_ID_RAW = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
+DEFAULT_POST_TIMES = os.getenv("POST_TIMES", "09:00,14:00,19:00").strip()
 
 TELEGRAM_ADMIN_ID = int(TELEGRAM_ADMIN_ID_RAW) if TELEGRAM_ADMIN_ID_RAW else None
 
@@ -31,12 +35,16 @@ if not TELEGRAM_CHANNEL_ID:
     raise RuntimeError("Не задан TELEGRAM_CHANNEL_ID")
 if not OPENAI_API_KEY:
     raise RuntimeError("Не задан OPENAI_API_KEY")
+if not PEXELS_API_KEY:
+    raise RuntimeError("Не задан PEXELS_API_KEY")
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "bot.db"
 PHOTOS_DIR = BASE_DIR / "photos"
+CACHE_DIR = PHOTOS_DIR / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,6 +53,18 @@ logging.basicConfig(
 logger = logging.getLogger("mirnaladoni_bot")
 
 scheduler_instance: Optional[AsyncIOScheduler] = None
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def slugify(text: str, max_len: int = 60) -> str:
+    text = text.lower().strip()
+    text = text.replace("ё", "e")
+    text = re.sub(r"[^a-zA-Zа-яА-Я0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text[:max_len] or "photo"
 
 
 def db():
@@ -65,6 +85,8 @@ def init_db():
                 content TEXT NOT NULL,
                 referral_url TEXT,
                 photo_path TEXT,
+                photo_credit TEXT,
+                photo_source_url TEXT,
                 status TEXT NOT NULL DEFAULT 'draft',
                 created_at TEXT NOT NULL,
                 published_at TEXT
@@ -128,16 +150,19 @@ def get_setting(key: str, default: str = "") -> str:
 def ensure_default_settings():
     defaults = {
         "autopost_enabled": "1",
-        "post_times": os.getenv("POST_TIMES", "09:00,14:00,19:00"),
+        "post_times": DEFAULT_POST_TIMES or "09:00,14:00,19:00",
         "default_ref_url": "https://t.me/TourJin_bot",
         "tourjin_bot_url": "https://t.me/TourJin_bot",
         "test_channel_id": TEST_CHANNEL_ID,
-        "photo_mode": "local",
         "topic_mode": "mixed",
+        "pexels_orientation": "landscape",
+        "pexels_size": "large",
+        "pexels_per_page": "10",
+        "photo_attribution_mode": "1",
     }
-    for k, v in defaults.items():
-        if get_setting(k, "") == "":
-            set_setting(k, v)
+    for key, value in defaults.items():
+        if get_setting(key, "") == "":
+            set_setting(key, value)
 
 
 def ensure_default_topics():
@@ -185,10 +210,6 @@ def ensure_default_partners():
             conn.commit()
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def is_admin(user_id: Optional[int]) -> bool:
     if TELEGRAM_ADMIN_ID is None:
         return True
@@ -228,17 +249,14 @@ async def safe_reply(update: Update, text: str):
         )
 
 
-def normalize_text(s: str) -> str:
-    return (s or "").lower().strip()
+def normalize_text(text: str) -> str:
+    return (text or "").lower().strip()
 
 
 def extract_keywords(text: str) -> List[str]:
     raw = normalize_text(text)
-    tokens = []
-    for part in raw.replace("\n", " ").replace(",", " ").replace(".", " ").split():
-        part = part.strip()
-        if len(part) >= 3:
-            tokens.append(part)
+    cleaned = re.sub(r"[^\w\sа-яА-ЯёЁ-]", " ", raw)
+    tokens = [t.strip("-_ ") for t in cleaned.split() if len(t.strip()) >= 3]
     return list(dict.fromkeys(tokens))
 
 
@@ -263,45 +281,112 @@ def choose_referral_url(topic: str, content: str) -> str:
     return best_url
 
 
-def choose_photo_for_topic(topic: str) -> Optional[Path]:
-    if not PHOTOS_DIR.exists():
-        return None
-
+def build_pexels_queries(topic: str) -> List[str]:
     topic_lower = normalize_text(topic)
-
-    candidates: List[Path] = []
-    for p in PHOTOS_DIR.rglob("*"):
-        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
-            name = p.stem.lower()
-            if any(word in name for word in extract_keywords(topic_lower)):
-                candidates.append(p)
-
-    if candidates:
-        return random.choice(candidates)
-
-    default_dir = PHOTOS_DIR / "default"
-    if default_dir.exists():
-        defaults = [
-            p for p in default_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
-        ]
-        if defaults:
-            return random.choice(defaults)
-
-    all_images = [
-        p for p in PHOTOS_DIR.rglob("*")
-        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+    base = [
+        topic_lower,
+        f"{topic_lower} travel",
+        f"{topic_lower} vacation",
+        f"{topic_lower} tourism",
     ]
-    return random.choice(all_images) if all_images else None
+
+    mappings = [
+        (["турция", "turkey"], ["turkey beach resort", "antalya resort", "turkey travel"]),
+        (["егип", "egypt"], ["egypt resort sea", "egypt beach vacation"]),
+        (["таиланд", "thai", "thailand"], ["thailand beach resort", "phuket travel"]),
+        (["отель", "hotel"], ["hotel room travel", "resort hotel"]),
+        (["море", "пляж", "beach"], ["beach resort", "sea vacation"]),
+        (["семей", "дет", "family"], ["family vacation beach", "family travel"]),
+        (["роман", "romantic"], ["romantic vacation beach", "couple travel resort"]),
+        (["бюджет", "деш", "эконом"], ["budget travel", "cheap vacation"]),
+        (["all inclusive"], ["all inclusive resort", "resort buffet vacation"]),
+        (["перелет", "самолет", "flight"], ["airport travel", "airplane travel"]),
+    ]
+
+    for keys, queries in mappings:
+        if any(k in topic_lower for k in keys):
+            base.extend(queries)
+
+    seen = []
+    for q in base:
+        q = q.strip()
+        if q and q not in seen:
+            seen.append(q)
+    return seen[:6]
 
 
-def format_post_text(content: str, referral_url: str) -> str:
-    cta = (
-        "\n\n"
-        "Хочешь подобрать вариант быстрее и без лишней суеты?\n"
-        f"Попробуй: {referral_url}"
-    )
-    return f"{content.strip()}{cta}"
+async def fetch_pexels_photo(topic: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    queries = build_pexels_queries(topic)
+    orientation = get_setting("pexels_orientation", "landscape")
+    size = get_setting("pexels_size", "large")
+    per_page = int(get_setting("pexels_per_page", "10") or "10")
+
+    headers = {"Authorization": PEXELS_API_KEY}
+
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as http:
+        for query in queries:
+            try:
+                response = await http.get(
+                    "https://api.pexels.com/v1/search",
+                    headers=headers,
+                    params={
+                        "query": query,
+                        "per_page": per_page,
+                        "orientation": orientation,
+                        "size": size,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+                photos = data.get("photos", [])
+                if not photos:
+                    continue
+
+                picked = random.choice(photos[: min(len(photos), 5)])
+                src = picked.get("src", {})
+                image_url = (
+                    src.get("large2x")
+                    or src.get("large")
+                    or src.get("medium")
+                    or src.get("original")
+                )
+                if not image_url:
+                    continue
+
+                photographer = picked.get("photographer") or "Unknown photographer"
+                photo_page = picked.get("url") or "https://www.pexels.com/"
+
+                filename = f"{slugify(topic)}_{picked.get('id', random.randint(1000, 9999))}.jpg"
+                filepath = CACHE_DIR / filename
+
+                if not filepath.exists():
+                    image_resp = await http.get(image_url)
+                    image_resp.raise_for_status()
+                    filepath.write_bytes(image_resp.content)
+
+                credit = f"Фото: {photographer} / Pexels"
+                return str(filepath), credit, photo_page
+            except Exception:
+                logger.exception("Ошибка загрузки фото из Pexels | query=%s", query)
+
+    return None, None, None
+
+
+def format_post_text(content: str, referral_url: str, photo_credit: Optional[str], photo_source_url: Optional[str]) -> str:
+    parts = [
+        content.strip(),
+        "",
+        "Хочешь подобрать вариант быстрее и без лишней суеты?",
+        f"Попробуй: {referral_url}",
+    ]
+
+    if get_setting("photo_attribution_mode", "1") == "1" and photo_credit:
+        if photo_source_url:
+            parts.extend(["", f"{photo_credit}", f"{photo_source_url}"])
+        else:
+            parts.extend(["", photo_credit])
+
+    return "\n".join(parts).strip()
 
 
 def parse_schedule(raw: str) -> List[Tuple[int, int]]:
@@ -311,7 +396,7 @@ def parse_schedule(raw: str) -> List[Tuple[int, int]]:
         hour_str, minute_str = item.split(":")
         hour = int(hour_str)
         minute = int(minute_str)
-        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
             raise ValueError(f"Некорректное время: {item}")
         result.append((hour, minute))
     if not result:
@@ -327,14 +412,17 @@ def save_post(
     content: str,
     referral_url: str,
     photo_path: Optional[str],
+    photo_credit: Optional[str],
+    photo_source_url: Optional[str],
     status: str = "draft",
 ) -> int:
     with closing(db()) as conn:
         cur = conn.execute("""
             INSERT INTO posts(
                 topic, theme_source, goal, post_type, content,
-                referral_url, photo_path, status, created_at, published_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                referral_url, photo_path, photo_credit, photo_source_url,
+                status, created_at, published_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             topic,
             theme_source,
@@ -343,6 +431,8 @@ def save_post(
             content,
             referral_url,
             photo_path,
+            photo_credit,
+            photo_source_url,
             status,
             now_iso(),
             None,
@@ -353,7 +443,7 @@ def save_post(
 
 def update_post_status(post_id: int, status: str):
     with closing(db()) as conn:
-        published_at = now_iso() if status == "published" else None
+        published_at = now_iso() if status in {"published", "tested"} else None
         conn.execute(
             "UPDATE posts SET status=?, published_at=COALESCE(?, published_at) WHERE id=?",
             (status, published_at, post_id),
@@ -408,17 +498,16 @@ async def generate_post_via_openai(topic: str) -> str:
 - стиль: живой, экспертный, доверительный
 - объём: 900–1400 символов
 - без воды и канцелярита
-- без эмодзи-перегруза
-- сделать пост полезным, а не абстрактным
-- в конце мягкий призыв к действию
-- не вставляй markdown-звёздочки
-- не выдумывай цены и факты, если они не даны
+- без перегруза эмодзи
+- пост должен быть полезным
+- не используй markdown-символы для оформления
+- не выдумывай точные цены и факты
 - можно упомянуть помощника для подбора туров: {tourjin_url}
-- текст должен быть оригинальным, не похожим на копипаст
+- текст должен быть оригинальным
 
 Структура:
 1. сильный заход
-2. польза/советы
+2. польза или советы
 3. короткий вывод
 4. мягкий CTA
 """.strip()
@@ -432,8 +521,7 @@ async def generate_post_via_openai(topic: str) -> str:
         ],
     )
 
-    text = response.choices[0].message.content or ""
-    text = text.strip()
+    text = (response.choices[0].message.content or "").strip()
     if not text:
         raise ValueError("OpenAI вернул пустой текст")
     return text
@@ -444,21 +532,56 @@ async def generate_post_with_retry(topic: str, retries: int = 3, delay: int = 4)
     for attempt in range(1, retries + 1):
         try:
             return await generate_post_via_openai(topic)
-        except Exception as e:
-            last_error = e
-            logger.exception("Ошибка генерации поста | topic=%s | attempt=%s/%s", topic, attempt, retries)
+        except Exception as exc:
+            last_error = exc
+            logger.exception(
+                "Ошибка генерации поста | topic=%s | attempt=%s/%s",
+                topic,
+                attempt,
+                retries,
+            )
             if attempt < retries:
                 await asyncio.sleep(delay)
+
     raise last_error
 
 
+async def create_post_record(topic: str, source_type: str, goal: str, post_type: str) -> int:
+    content = await generate_post_with_retry(topic)
+    referral_url = choose_referral_url(topic, content)
+    photo_path, photo_credit, photo_source_url = await fetch_pexels_photo(topic)
+
+    post_id = save_post(
+        topic=topic,
+        theme_source=source_type,
+        goal=goal,
+        post_type=post_type,
+        content=content,
+        referral_url=referral_url,
+        photo_path=photo_path,
+        photo_credit=photo_credit,
+        photo_source_url=photo_source_url,
+        status="draft",
+    )
+    return post_id
+
+
 async def publish_post_record(bot, channel_id: str, row, mark_status: str = "published"):
-    text = format_post_text(row["content"], row["referral_url"] or get_setting("default_ref_url"))
+    text = format_post_text(
+        row["content"],
+        row["referral_url"] or get_setting("default_ref_url", "https://t.me/TourJin_bot"),
+        row["photo_credit"],
+        row["photo_source_url"],
+    )
 
     photo_path = row["photo_path"]
     if photo_path and Path(photo_path).exists():
-        with open(photo_path, "rb") as f:
-            await bot.send_photo(chat_id=channel_id, photo=f, caption=text[:1024])
+        with open(photo_path, "rb") as photo_file:
+            await bot.send_photo(
+                chat_id=channel_id,
+                photo=photo_file,
+                caption=text[:1024],
+            )
     else:
         await bot.send_message(chat_id=channel_id, text=text)
 
@@ -477,9 +600,27 @@ def format_post_card(row) -> str:
         f"Цель: {row['goal'] or '-'}\n"
         f"Канал: {TELEGRAM_CHANNEL_ID}\n"
         f"Опубликован: {'да' if row['status'] == 'published' else 'нет'}\n"
-        f"Реф-ссылка: {row['referral_url'] or '-'}\n\n"
+        f"Реф-ссылка: {row['referral_url'] or '-'}\n"
+        f"Фото: {'да' if row['photo_path'] else 'нет'}\n\n"
         f"{row['content']}"
     )
+
+
+async def scheduled_autopost_job(app: Application):
+    if get_setting("autopost_enabled", "1") != "1":
+        logger.info("Автопостинг отключён, задача пропущена")
+        return
+
+    topic, source_type = get_next_topic()
+    post_id = await create_post_record(
+        topic=topic,
+        source_type=source_type,
+        goal="trust",
+        post_type="auto",
+    )
+    row = get_post(post_id)
+    await publish_post_record(app.bot, TELEGRAM_CHANNEL_ID, row, mark_status="published")
+    logger.info("Автопост опубликован | id=%s | topic=%s", post_id, topic)
 
 
 def rebuild_scheduler(app: Application):
@@ -487,21 +628,22 @@ def rebuild_scheduler(app: Application):
 
     if scheduler_instance:
         try:
-            scheduler_instance.remove_all_jobs()
-            scheduler_instance.shutdown(wait=False)
+            if scheduler_instance.running:
+                scheduler_instance.remove_all_jobs()
+                scheduler_instance.shutdown(wait=False)
         except Exception:
             logger.exception("Не удалось корректно остановить старый scheduler")
 
     scheduler_instance = AsyncIOScheduler(timezone="Europe/Berlin")
 
     autopost_enabled = get_setting("autopost_enabled", "1") == "1"
-    schedule_raw = get_setting("post_times", "09:00,14:00,19:00")
+    schedule_raw = get_setting("post_times", DEFAULT_POST_TIMES or "09:00,14:00,19:00")
 
     if autopost_enabled:
         for hour, minute in parse_schedule(schedule_raw):
             scheduler_instance.add_job(
                 scheduled_autopost_job,
-                "cron",
+                trigger="cron",
                 hour=hour,
                 minute=minute,
                 args=[app],
@@ -515,36 +657,11 @@ def rebuild_scheduler(app: Application):
     logger.info("Scheduler rebuilt | enabled=%s | times=%s", autopost_enabled, schedule_raw)
 
 
-async def scheduled_autopost_job(app: Application):
-    if get_setting("autopost_enabled", "1") != "1":
-        logger.info("Автопостинг отключён, задача пропущена")
-        return
-
-    topic, source_type = get_next_topic()
-    content = await generate_post_with_retry(topic)
-    referral_url = choose_referral_url(topic, content)
-    photo_path = choose_photo_for_topic(topic)
-    post_id = save_post(
-        topic=topic,
-        theme_source=source_type,
-        goal="trust",
-        post_type="auto",
-        content=content,
-        referral_url=referral_url,
-        photo_path=str(photo_path) if photo_path else None,
-        status="draft",
-    )
-    row = get_post(post_id)
-    await publish_post_record(app.bot, TELEGRAM_CHANNEL_ID, row, mark_status="published")
-    logger.info("Автопост опубликован | id=%s | topic=%s", post_id, topic)
-
-
 @admin_only
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(
         update,
         "Бот работает.\n\n"
-        "Главные команды:\n"
         "/gen [тема] — сгенерировать пост\n"
         "/publish [id] — опубликовать пост\n"
         "/last — последний пост\n"
@@ -558,7 +675,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/topics — показать темы\n"
         "/partners — показать партнёрские ссылки\n"
         "/partner_add name | keywords | url — добавить партнёрскую ссылку\n"
-        "/set_tourjin https://t.me/TourJin_bot — обновить ссылку"
+        "/set_tourjin https://t.me/TourJin_bot — обновить ссылку\n"
+        "/set_test_channel @my_test_channel — обновить тестовый канал"
     )
 
 
@@ -577,30 +695,20 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         source_type = "manual"
 
     await safe_reply(update, f"Генерирую пост по теме: {topic}")
-
-    content = await generate_post_with_retry(topic)
-    referral_url = choose_referral_url(topic, content)
-    photo_path = choose_photo_for_topic(topic)
-
-    post_id = save_post(
+    post_id = await create_post_record(
         topic=topic,
-        theme_source=source_type,
+        source_type=source_type,
         goal="trust",
         post_type="expert",
-        content=content,
-        referral_url=referral_url,
-        photo_path=str(photo_path) if photo_path else None,
-        status="draft",
     )
-
     row = get_post(post_id)
-    msg = (
-        f"Пост создан.\n\n"
-        f"{format_post_card(row)}\n\n"
+
+    await safe_reply(
+        update,
+        f"Пост создан.\n\n{format_post_card(row)}\n\n"
         f"Для публикации: /publish {post_id}\n"
         f"Для теста: /test_post {post_id}"
     )
-    await safe_reply(update, msg)
 
 
 @admin_only
@@ -609,9 +717,13 @@ async def publish_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, "Пример: /publish 12")
         return
 
-    post_id = int(context.args[0])
-    row = get_post(post_id)
+    try:
+        post_id = int(context.args[0])
+    except ValueError:
+        await safe_reply(update, "ID должен быть числом. Пример: /publish 12")
+        return
 
+    row = get_post(post_id)
     if not row:
         await safe_reply(update, f"Пост с ID {post_id} не найден.")
         return
@@ -629,11 +741,12 @@ async def last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     enabled = "включен" if get_setting("autopost_enabled", "1") == "1" else "выключен"
-    schedule_raw = get_setting("post_times", "09:00,14:00,19:00")
+    schedule_raw = get_setting("post_times", DEFAULT_POST_TIMES or "09:00,14:00,19:00")
     await safe_reply(
         update,
-        f"Автопостинг: {enabled}\nВремя публикаций: {schedule_raw}\n\n"
-        f"Изменить: /set_schedule 09:00,14:00,19:00"
+        f"Автопостинг: {enabled}\n"
+        f"Время публикаций: {schedule_raw}\n\n"
+        f"Изменить: /set_schedule 08:30,13:00,18:45"
     )
 
 
@@ -644,7 +757,12 @@ async def set_schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, "Пример: /set_schedule 08:30,13:00,18:45")
         return
 
-    parse_schedule(raw)
+    try:
+        parse_schedule(raw)
+    except Exception as exc:
+        await safe_reply(update, f"Ошибка расписания: {exc}")
+        return
+
     set_setting("post_times", raw)
     rebuild_scheduler(context.application)
     await safe_reply(update, f"Расписание обновлено: {raw}")
@@ -673,20 +791,11 @@ async def test_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     row = get_last_post()
     if not row:
-        topic = "Тестовый пост для проверки канала"
-        content = await generate_post_with_retry(topic)
-        referral_url = choose_referral_url(topic, content)
-        photo_path = choose_photo_for_topic(topic)
-
-        post_id = save_post(
-            topic=topic,
-            theme_source="test",
+        post_id = await create_post_record(
+            topic="Тестовый пост для проверки канала",
+            source_type="test",
             goal="test",
             post_type="test",
-            content=content,
-            referral_url=referral_url,
-            photo_path=str(photo_path) if photo_path else None,
-            status="draft",
         )
         row = get_post(post_id)
 
@@ -706,7 +815,12 @@ async def test_post_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, "Пример: /test_post 12")
         return
 
-    post_id = int(context.args[0])
+    try:
+        post_id = int(context.args[0])
+    except ValueError:
+        await safe_reply(update, "ID должен быть числом. Пример: /test_post 12")
+        return
+
     row = get_post(post_id)
     if not row:
         await safe_reply(update, f"Пост с ID {post_id} не найден.")
@@ -721,10 +835,7 @@ async def test_post_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await publish_post_record(context.bot, test_channel_id, row, mark_status="tested")
         await safe_reply(update, f"Пост {post_id} отправлен в тестовый канал.")
     except Forbidden:
-        await safe_reply(
-            update,
-            "Бот не может публиковать в тестовый канал. Проверьте членство и права."
-        )
+        await safe_reply(update, "Бот не может публиковать в тестовый канал. Проверьте членство и права.")
 
 
 @admin_only
@@ -843,15 +954,25 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text="Произошла ошибка. Она записана в логи. Меню возвращено.",
+                text="Произошла ошибка. Она записана в логи.",
                 reply_markup=main_menu_keyboard(),
             )
         except Exception:
             logger.exception("Не удалось отправить сообщение об ошибке пользователю")
 
 
+async def post_init(application: Application) -> None:
+    rebuild_scheduler(application)
+    logger.info("Bot starting...")
+
+
 def build_application() -> Application:
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
@@ -878,8 +999,6 @@ def build_application() -> Application:
 def main():
     init_db()
     app = build_application()
-    rebuild_scheduler(app)
-    logger.info("Bot starting...")
     app.run_polling(drop_pending_updates=True)
 
 
