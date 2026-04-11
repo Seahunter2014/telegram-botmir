@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 import random
@@ -7,7 +8,7 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 
 import httpx
 from dotenv import load_dotenv
@@ -27,9 +28,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
 DEFAULT_POST_TIMES = os.getenv("POST_TIMES", "09:00,14:00,19:00").strip()
 
-# Фиксированное время UTC+3, независимо от сервера/VPN
 BOT_TZ = timezone(timedelta(hours=3))
-
 TELEGRAM_ADMIN_ID = int(TELEGRAM_ADMIN_ID_RAW) if TELEGRAM_ADMIN_ID_RAW else None
 
 if not TELEGRAM_BOT_TOKEN:
@@ -38,8 +37,6 @@ if not TELEGRAM_CHANNEL_ID:
     raise RuntimeError("Не задан TELEGRAM_CHANNEL_ID")
 if not OPENAI_API_KEY:
     raise RuntimeError("Не задан OPENAI_API_KEY")
-if not PEXELS_API_KEY:
-    raise RuntimeError("Не задан PEXELS_API_KEY")
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -57,23 +54,123 @@ logger = logging.getLogger("mirnaladoni_bot")
 
 scheduler_instance: Optional[AsyncIOScheduler] = None
 
+POST_TYPES = [
+    ("value", 35),
+    ("engagement", 20),
+    ("expert", 15),
+    ("trust", 10),
+    ("selling", 15),
+    ("experimental", 5),
+]
+
+SERVICES: List[Dict[str, Any]] = [
+    {
+        "key": "ostrovok",
+        "url": "https://ostrovok.tp.st/yHBoZUg7",
+        "keywords": ["отель", "отели", "гостиница", "гостиницы", "жилье", "жильё", "апартаменты", "проживание"],
+        "anchor_options": ["варианты отелей", "подходящее жильё", "варианты проживания"],
+    },
+    {
+        "key": "yandex_travel",
+        "url": "https://yandex.tp.st/y94GSOah",
+        "keywords": ["поездка", "путешествие", "путешествия", "отдых", "отпуск", "маршрут"],
+        "anchor_options": ["варианты поездки", "варианты отдыха", "удобные варианты"],
+    },
+    {
+        "key": "aviasales",
+        "url": "https://aviasales.tp.st/hYipm2Ac",
+        "keywords": ["билет", "билеты", "перелет", "перелёт", "авиабилеты", "самолет", "самолёт", "рейс"],
+        "anchor_options": ["авиабилеты", "билеты на перелёт", "варианты перелёта"],
+    },
+    {
+        "key": "vip_zal",
+        "url": "https://vip-zal.tp.st/VUTiM7FJ",
+        "keywords": ["лаунж", "бизнес-зал", "бизнес зал", "зал ожидания", "вылет", "пересадка"],
+        "anchor_options": ["доступ в лаунж", "варианты бизнес-залов", "лаунж-залы в аэропорту"],
+    },
+    {
+        "key": "onlinetours",
+        "url": "https://onlinetours.tp.st/Um2ycow9",
+        "keywords": ["тур", "туры", "путевка", "путёвка", "пакетный тур", "пакетные туры"],
+        "anchor_options": ["пакетные туры", "варианты тура", "туры по направлению"],
+    },
+    {
+        "key": "travelata",
+        "url": "https://travelata.tp.st/O6m2Lg6H",
+        "keywords": ["горящий тур", "горящие туры", "спецпредложение", "спецпредложения", "тур", "туры"],
+        "anchor_options": ["горящие туры", "туры со скидкой", "интересные туры"],
+    },
+    {
+        "key": "tutu",
+        "url": "https://tutu.tp.st/dZglLc7q",
+        "keywords": ["поезд", "поезда", "автобус", "автобусы", "электричка", "жд", "транспорт"],
+        "anchor_options": ["билеты на транспорт", "варианты переезда", "билеты на поезд или автобус"],
+    },
+    {
+        "key": "rail_europe",
+        "url": "https://raileurope.tp.st/nWODZ4nI",
+        "keywords": ["европа", "поезд по европе", "поезда европы", "европейский поезд", "rail europe"],
+        "anchor_options": ["жд билеты по Европе", "поезда по Европе", "европейские маршруты"],
+    },
+    {
+        "key": "cherehapa",
+        "url": "https://cherehapa.tp.st/RIsddc4I",
+        "keywords": ["страховка", "страхование", "полис", "страховой"],
+        "anchor_options": ["страховку для поездки", "подходящий страховой полис", "варианты страховки"],
+    },
+    {
+        "key": "kiwitaxi",
+        "url": "https://kiwitaxi.tp.st/Ven9kvYz",
+        "keywords": ["трансфер", "аэропорт", "из аэропорта", "в аэропорт", "встреча", "дорога из аэропорта"],
+        "anchor_options": ["трансфер из аэропорта", "варианты трансфера", "поездку из аэропорта"],
+    },
+    {
+        "key": "localrent",
+        "url": "https://localrent.tp.st/Q77W1ZWX",
+        "keywords": ["аренда авто", "машина", "авто", "прокат авто", "арендовать машину"],
+        "anchor_options": ["аренду авто", "машину для поездки", "варианты проката авто"],
+    },
+    {
+        "key": "bikesbooking",
+        "url": "https://bikesbooking.tp.st/eMN1TXvi",
+        "keywords": ["байк", "скутер", "мотоцикл", "багги", "мопед"],
+        "anchor_options": ["прокат байка или скутера", "двухколёсный транспорт", "прокат скутера"],
+    },
+    {
+        "key": "sputnik8",
+        "url": "https://sputnik8.tp.st/FQZC0UxF",
+        "keywords": ["экскурсия", "экскурсии", "гид", "достопримечательности", "что посмотреть", "прогулка"],
+        "anchor_options": ["экскурсии по месту", "варианты экскурсий", "что посмотреть на месте"],
+    },
+    {
+        "key": "ticketnetwork",
+        "url": "https://ticketnetwork.tp.st/evSOqzXe",
+        "keywords": ["концерт", "шоу", "событие", "мероприятие", "матч", "спектакль"],
+        "anchor_options": ["билеты на мероприятия", "события по направлению", "интересные мероприятия"],
+    },
+    {
+        "key": "trip_cruises",
+        "url": "https://www.trip.com/t/OjTmFMTwFU2",
+        "keywords": ["круиз", "круизы", "лайнер"],
+        "anchor_options": ["варианты круизов", "круизы по направлению", "подходящий круиз"],
+    },
+]
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def slugify(text: str, max_len: int = 60) -> str:
-    text = text.lower().strip()
-    text = text.replace("ё", "e")
-    text = re.sub(r"[^a-zA-Zа-яА-Я0-9]+", "_", text)
-    text = re.sub(r"_+", "_", text).strip("_")
-    return text[:max_len] or "photo"
 
 
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    names = {col[1] for col in cols}
+    if column not in names:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def init_db():
@@ -87,6 +184,7 @@ def init_db():
                 post_type TEXT,
                 content TEXT NOT NULL,
                 referral_url TEXT,
+                monetization_service TEXT,
                 photo_path TEXT,
                 photo_credit TEXT,
                 photo_source_url TEXT,
@@ -95,6 +193,14 @@ def init_db():
                 published_at TEXT
             )
         """)
+
+        ensure_column(conn, "posts", "referral_url", "TEXT")
+        ensure_column(conn, "posts", "monetization_service", "TEXT")
+        ensure_column(conn, "posts", "photo_path", "TEXT")
+        ensure_column(conn, "posts", "photo_credit", "TEXT")
+        ensure_column(conn, "posts", "photo_source_url", "TEXT")
+        ensure_column(conn, "posts", "status", "TEXT NOT NULL DEFAULT 'draft'")
+        ensure_column(conn, "posts", "published_at", "TEXT")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings(
@@ -114,22 +220,10 @@ def init_db():
             )
         """)
 
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS partners(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                keywords TEXT NOT NULL,
-                url TEXT NOT NULL,
-                marker TEXT DEFAULT '',
-                is_active INTEGER DEFAULT 1
-            )
-        """)
-
         conn.commit()
 
     ensure_default_settings()
     ensure_default_topics()
-    ensure_default_partners()
 
 
 def set_setting(key: str, value: str):
@@ -154,14 +248,12 @@ def ensure_default_settings():
     defaults = {
         "autopost_enabled": "1",
         "post_times": DEFAULT_POST_TIMES or "09:00,14:00,19:00",
-        "default_ref_url": "https://t.me/TourJin_bot",
-        "tourjin_bot_url": "https://t.me/TourJin_bot",
         "test_channel_id": TEST_CHANNEL_ID,
-        "topic_mode": "mixed",
+        "photo_attribution_mode": "0",
         "pexels_orientation": "landscape",
         "pexels_size": "large",
         "pexels_per_page": "10",
-        "photo_attribution_mode": "0",  # можно включить 1, если захотите показывать credit
+        "tourjin_bot_url": "https://t.me/TourJin_bot",
     }
     for key, value in defaults.items():
         if get_setting(key, "") == "":
@@ -170,18 +262,18 @@ def ensure_default_settings():
 
 def ensure_default_topics():
     default_topics = [
-        "Как выбрать тур без переплаты",
         "5 ошибок при бронировании отпуска",
+        "Как выбрать идеальный отель без разочарований",
+        "Когда лучше покупать билеты",
+        "Что проверить перед поездкой за границу",
+        "Как не переплатить за отдых",
+        "Как выбрать страховку в поездку",
+        "Что важно знать про трансфер из аэропорта",
+        "Где туристы чаще всего теряют деньги в отпуске",
+        "Как не испортить первый день отдыха",
         "Куда поехать на море недорого",
-        "Семейный отдых: как выбрать комфортный тур",
-        "Когда лучше покупать туры",
-        "Как сэкономить на all inclusive",
-        "Что взять с собой в отпуск",
-        "Как выбрать отель без разочарования",
-        "Короткие путешествия на 3–5 дней",
-        "Лучшие идеи для романтического отдыха",
-        "Отдых с детьми без стресса",
-        "Как проверить тур и не попасть на лишние траты",
+        "Как сэкономить на экскурсиях",
+        "Семейный отдых: что важно предусмотреть заранее",
     ]
     with closing(db()) as conn:
         count = conn.execute("SELECT COUNT(*) AS c FROM topics").fetchone()["c"]
@@ -194,22 +286,6 @@ def ensure_default_topics():
                     """,
                     (topic, now_iso()),
                 )
-            conn.commit()
-
-
-def ensure_default_partners():
-    with closing(db()) as conn:
-        count = conn.execute("SELECT COUNT(*) AS c FROM partners").fetchone()["c"]
-        if count == 0:
-            conn.execute("""
-                INSERT INTO partners(name, keywords, url, marker, is_active)
-                VALUES(?, ?, ?, ?, 1)
-            """, (
-                "TourJin",
-                "тур,туры,путешествие,путешествия,отпуск,отель,отели,перелет,море,пляж,курорт,отдых",
-                "https://t.me/TourJin_bot",
-                "main",
-            ))
             conn.commit()
 
 
@@ -234,7 +310,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             ["/gen", "/last", "/schedule"],
             ["/autopost_on", "/autopost_off", "/test_channel"],
-            ["/topics", "/partners", "/menu"],
+            ["/topics", "/menu", "/set_schedule"],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -256,6 +332,18 @@ def normalize_text(text: str) -> str:
     return (text or "").lower().strip()
 
 
+def escape_html_text(text: str) -> str:
+    return html.escape(text or "", quote=False)
+
+
+def slugify(text: str, max_len: int = 60) -> str:
+    text = text.lower().strip()
+    text = text.replace("ё", "e")
+    text = re.sub(r"[^a-zA-Zа-яА-Я0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text[:max_len] or "photo"
+
+
 def extract_keywords(text: str) -> List[str]:
     raw = normalize_text(text)
     cleaned = re.sub(r"[^\w\sа-яА-ЯёЁ-]", " ", raw)
@@ -263,25 +351,144 @@ def extract_keywords(text: str) -> List[str]:
     return list(dict.fromkeys(tokens))
 
 
-def choose_referral_url(topic: str, content: str) -> str:
+def cleanup_post_text(text: str) -> str:
+    text = text.replace("***", "").replace("**", "").replace("__", "")
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"^([^\w\s])(\d)", r"\1 \2", text)
+
+    broken_endings = ["осн", "под", "пер", "отд", "тур", "поезд", "путеш", "предлож", "вариан"]
+    for ending in broken_endings:
+        if text.lower().endswith(ending):
+            text = text[:-len(ending)].rstrip(" ,.-:;")
+
+    return text.strip()
+
+
+def looks_incomplete(text: str) -> bool:
+    stripped = text.strip()
+
+    if len(stripped) < 420:
+        return True
+
+    if stripped.endswith((":", ",", ";", "—", "-", "…")):
+        return True
+
+    last_line = stripped.splitlines()[-1].strip()
+    if stripped and stripped[-1].isalnum() and len(last_line.split()) <= 2:
+        return True
+
+    return False
+
+
+def trim_to_limit(text: str, max_len: int) -> str:
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+
+    shortened = text[:max_len].rstrip()
+    last_break = max(
+        shortened.rfind("\n"),
+        shortened.rfind(". "),
+        shortened.rfind("! "),
+        shortened.rfind("? "),
+    )
+
+    if last_break > max_len * 0.6:
+        shortened = shortened[:last_break + 1].rstrip()
+
+    return shortened.rstrip(" ,;:-") + "…"
+
+
+def choose_post_type() -> str:
+    pool: List[str] = []
+    for name, weight in POST_TYPES:
+        pool.extend([name] * weight)
+    return random.choice(pool)
+
+
+def should_insert_monetization(post_type: str) -> bool:
+    if post_type in {"engagement", "trust"}:
+        return False
+    if post_type == "value":
+        return random.random() < 0.45
+    if post_type == "expert":
+        return random.random() < 0.50
+    if post_type == "experimental":
+        return random.random() < 0.35
+    if post_type == "selling":
+        return True
+    return False
+
+
+def choose_discussion_cta(post_type: str) -> str:
+    if post_type == "engagement":
+        return random.choice([
+            "А вы бы что выбрали?",
+            "У кого было похоже?",
+            "Или я один так делаю?",
+            "Что у вас обычно срабатывает лучше?",
+        ])
+    if post_type == "value":
+        return random.choice([
+            "Сохрани, чтобы не потерять. У тебя было что-то похожее?",
+            "Что бы ты добавил к этому списку?",
+            "У кого на практике это уже сработало?",
+        ])
+    if post_type == "expert":
+        return random.choice([
+            "Вы с этим согласны?",
+            "У кого был другой опыт?",
+            "Что для вас здесь самое важное?",
+        ])
+    if post_type == "trust":
+        return random.choice([
+            "У вас было что-то похожее?",
+            "Кто тоже через это проходил?",
+            "У кого была такая история?",
+        ])
+    if post_type == "selling":
+        return random.choice([
+            "Если тема актуальна — лучше сохранить пост заранее.",
+            "Такое обычно вспоминают слишком поздно, поэтому лучше сохранить.",
+            "Отправь тому, кто сейчас как раз планирует поездку.",
+        ])
+    return random.choice([
+        "Как вам такой формат?",
+        "Продолжать такие разборы?",
+    ])
+
+
+def choose_service(topic: str, content: str = "") -> Optional[Dict[str, Any]]:
     combined = f"{topic} {content}".lower()
-
-    with closing(db()) as conn:
-        rows = conn.execute(
-            "SELECT name, keywords, url FROM partners WHERE is_active=1 ORDER BY id ASC"
-        ).fetchall()
-
-    best_url = get_setting("default_ref_url", "https://t.me/TourJin_bot")
+    best_service = None
     best_score = 0
 
-    for row in rows:
-        keywords = [k.strip().lower() for k in row["keywords"].split(",") if k.strip()]
-        score = sum(1 for kw in keywords if kw in combined)
+    for service in SERVICES:
+        score = 0
+        for kw in service["keywords"]:
+            if kw in combined:
+                score += 1
         if score > best_score:
             best_score = score
-            best_url = row["url"]
+            best_service = service
 
-    return best_url
+    return best_service if best_score > 0 else None
+
+
+def choose_anchor_text(service: Dict[str, Any]) -> str:
+    return random.choice(service["anchor_options"])
+
+
+def build_native_link_paragraph(service: Dict[str, Any]) -> str:
+    url = service["url"]
+    anchor = escape_html_text(choose_anchor_text(service))
+    templates = [
+        f'Если хочется спокойно сравнить варианты — можно посмотреть <a href="{url}">{anchor}</a>.',
+        f'Обычно в таких случаях удобнее заранее проверить <a href="{url}">{anchor}</a>.',
+        f'Чтобы не тратить время на хаотичный поиск, можно открыть <a href="{url}">{anchor}</a>.',
+    ]
+    return random.choice(templates)
 
 
 def build_pexels_queries(topic: str) -> List[str]:
@@ -294,16 +501,15 @@ def build_pexels_queries(topic: str) -> List[str]:
     ]
 
     mappings = [
-        (["турция", "turkey"], ["turkey beach resort", "antalya resort", "turkey travel"]),
+        (["турция", "turkey"], ["turkey beach resort", "antalya resort"]),
         (["егип", "egypt"], ["egypt resort sea", "egypt beach vacation"]),
         (["таиланд", "thai", "thailand"], ["thailand beach resort", "phuket travel"]),
         (["отель", "hotel"], ["hotel room travel", "resort hotel"]),
-        (["море", "пляж", "beach"], ["beach resort", "sea vacation"]),
-        (["семей", "дет", "family"], ["family vacation beach", "family travel"]),
-        (["роман", "romantic"], ["romantic vacation beach", "couple travel resort"]),
-        (["бюджет", "деш", "эконом"], ["budget travel", "cheap vacation"]),
-        (["all inclusive"], ["all inclusive resort", "resort buffet vacation"]),
-        (["перелет", "самолет", "flight"], ["airport travel", "airplane travel"]),
+        (["море", "пляж"], ["beach resort", "sea vacation"]),
+        (["семей", "дет"], ["family vacation beach", "family travel"]),
+        (["роман", "пара"], ["romantic vacation beach", "couple resort"]),
+        (["билет", "самолет", "перелет"], ["airport travel", "airplane window travel"]),
+        (["экскур", "достопримеч"], ["city tour travel", "tourist sightseeing"]),
     ]
 
     for keys, queries in mappings:
@@ -319,6 +525,9 @@ def build_pexels_queries(topic: str) -> List[str]:
 
 
 async def fetch_pexels_photo(topic: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    if not PEXELS_API_KEY:
+        return None, None, None
+
     queries = build_pexels_queries(topic)
     orientation = get_setting("pexels_orientation", "landscape")
     size = get_setting("pexels_size", "large")
@@ -375,135 +584,211 @@ async def fetch_pexels_photo(topic: str) -> Tuple[Optional[str], Optional[str], 
     return None, None, None
 
 
-def cleanup_post_text(text: str) -> str:
-    text = text.replace("***", "").replace("**", "").replace("__", "")
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    text = re.sub(r"[ \t]+", " ", text)
+def post_type_instructions(post_type: str) -> str:
+    mapping = {
+        "value": (
+            "Сделай полезный пост с конкретикой. "
+            "Дай 2–3 практичных наблюдения, ошибки или подсказки. "
+            "Тон: понятный, живой, без назидательности."
+        ),
+        "engagement": (
+            "Сделай пост для диалога и реакции. "
+            "Главная цель — вызвать мнение, сравнение или обсуждение. "
+            "Не продавай."
+        ),
+        "expert": (
+            "Сделай экспертный разбор. "
+            "Покажи взгляд человека, который хорошо понимает тему. "
+            "Без сухой энциклопедичности."
+        ),
+        "trust": (
+            "Сделай доверительный пост. "
+            "Как будто автор делится наблюдением или личным выводом. "
+            "Без продажности."
+        ),
+        "selling": (
+            "Сделай мягко продающий пост. "
+            "Через проблему и решение, без ощущения рекламы."
+        ),
+        "experimental": (
+            "Сделай нестандартный пост: неожиданный угол, парадокс, контраст, гипотеза."
+        ),
+    }
+    return mapping.get(post_type, mapping["value"])
 
-    broken_endings = ["осн", "под", "пер", "отд", "тур", "поезд", "путеш", "основан", "наиб", "предлож"]
-    for ending in broken_endings:
-        if text.lower().endswith(ending):
-            text = text[:-len(ending)].rstrip(" ,.-:;")
 
-    return text.strip()
+async def generate_post_via_openai(topic: str, post_type: str) -> str:
+    prompt = f"""
+Ты пишешь Telegram-пост для travel-канала «Мир на ладони».
 
+Тема: {topic}
+Тип поста: {post_type}
 
-def looks_incomplete(text: str) -> bool:
-    stripped = text.strip()
+Жёсткие требования:
+- язык: русский
+- стиль: живой, человеческий, как автор travel-канала, а не SEO-текст
+- умеренные эмодзи: 1–2 в тексте, максимум 3
+- никакого канцелярита и AI-воды
+- не упоминай бренды сервисов
+- не вставляй ссылки
+- не делай прямых продаж
+- текст должен быть законченным и не длиннее примерно 650–780 символов
+- структура:
+  1) короткий заголовок
+  2) короткий заход
+  3) 2–3 смысловых блока
+  4) короткий вывод
+- каждый смысловой блок делай коротким и удобным для чтения с телефона
+- можно задавать ритм через подзаголовки: "Ошибка 1:", "Что важно:", "Момент 2:" и т.п.
+- не используй markdown-разметку со звёздочками
 
-    if len(stripped) < 500:
-        return True
+Инструкция по типу поста:
+{post_type_instructions(post_type)}
 
-    if stripped.endswith((":", ",", ";", "—", "-", "…")):
-        return True
+Верни только готовый текст поста.
+""".strip()
 
-    last_line = stripped.splitlines()[-1].strip()
-    if stripped and stripped[-1].isalnum() and len(last_line.split()) <= 2:
-        return True
-
-    return False
-
-
-def trim_to_limit(text: str, max_len: int) -> str:
-    text = text.strip()
-    if len(text) <= max_len:
-        return text
-
-    shortened = text[:max_len].rstrip()
-    last_break = max(
-        shortened.rfind("\n"),
-        shortened.rfind(". "),
-        shortened.rfind("! "),
-        shortened.rfind("? "),
+    response = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.8,
+        max_tokens=850,
+        messages=[
+            {"role": "system", "content": "Ты сильный growth-редактор Telegram-канала про путешествия."},
+            {"role": "user", "content": prompt},
+        ],
     )
 
-    if last_break > max_len * 0.6:
-        shortened = shortened[:last_break + 1].rstrip()
+    text = (response.choices[0].message.content or "").strip()
+    if not text:
+        raise ValueError("OpenAI вернул пустой текст")
 
-    return shortened.rstrip(" ,;:-") + "…"
+    return cleanup_post_text(text)
 
 
-def choose_post_ending(topic: str, referral_url: str) -> str:
-    topic_lower = normalize_text(topic)
+async def generate_post_with_retry(topic: str, post_type: str, retries: int = 3, delay: int = 4) -> str:
+    last_error = None
 
-    sales_keywords = [
-        "тур", "туры", "отель", "отдых", "море", "пляж", "курорт",
-        "путешествие", "путешествия", "отпуск", "перелет", "all inclusive"
-    ]
+    for attempt in range(1, retries + 1):
+        try:
+            text = await generate_post_via_openai(topic, post_type)
 
-    neutral_keywords = [
-        "лайфхак", "совет", "ошибка", "чек", "список", "что взять",
-        "как выбрать", "как проверить"
-    ]
+            if looks_incomplete(text):
+                raise ValueError("Сгенерированный текст выглядит незавершённым")
 
-    sales_match = any(word in topic_lower for word in sales_keywords)
-    neutral_match = any(word in topic_lower for word in neutral_keywords)
+            return text
 
-    sales_endings = [
-        f"Если хочешь упростить выбор поездки, загляни сюда 👇\n{referral_url}\n\nПодпишись на канал, поставь ❤️ и поделись постом с друзьями ✈️",
-        f"Для удобного поиска вариантов можно использовать бота 👇\n{referral_url}\n\nНапиши в комментариях своё мнение и отправь пост друзьям 🌍",
-        f"Сохрани пост, чтобы не потерять.\nА если захочешь посмотреть варианты поездки — вот бот 👇\n{referral_url}\n\nИ не забудь поставить ❤️",
-    ]
+        except Exception as exc:
+            last_error = exc
+            logger.exception(
+                "Ошибка генерации поста | topic=%s | type=%s | attempt=%s/%s",
+                topic,
+                post_type,
+                attempt,
+                retries,
+            )
+            if attempt < retries:
+                await asyncio.sleep(delay)
 
-    mixed_endings = [
-        f"Подпишись на канал — здесь только полезные travel-разборы ✈️\n\nЕсли тема уже актуальна для тебя, можно посмотреть варианты тут:\n{referral_url}",
-        f"Сохрани пост, поставь ❤️ и поделись с друзьями.\n\nА для удобного поиска вариантов есть бот 👇\n{referral_url}",
-    ]
+    raise last_error
 
-    neutral_endings = [
-        "Подписывайся на канал, если любишь практичные советы для путешествий ✈️\n\nПоставь ❤️ и поделись постом с друзьями.",
-        "Сохрани пост, чтобы не потерять, и поделись с друзьями 🌍\n\nА в комментариях напиши своё мнение или опыт.",
-        "Если было полезно — подпишись на канал 💙\n\nПоставь ❤️ и напиши в комментариях, как у тебя было на практике.",
-    ]
 
-    if sales_match:
-        return random.choice(sales_endings)
-    if neutral_match:
-        return random.choice(mixed_endings)
-    return random.choice(neutral_endings)
+def convert_plain_text_to_html(post_text: str) -> str:
+    text = (post_text or "").strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not parts:
+        return ""
+
+    html_blocks = []
+    title = escape_html_text(parts[0])
+    html_blocks.append(f"<b>{title}</b>")
+
+    subheading_pattern = re.compile(
+        r"^(Ошибка\s*\d+|Совет\s*\d+|Шаг\s*\d+|Пункт\s*\d+|Момент\s*\d+|Что важно|На что смотреть|Что проверить)\s*[:.-]?\s*(.*)$",
+        re.IGNORECASE,
+    )
+
+    for block in parts[1:]:
+        escaped = escape_html_text(block)
+        lines = [line.strip() for line in escaped.split("\n") if line.strip()]
+
+        if len(lines) == 1:
+            m = subheading_pattern.match(html.unescape(lines[0]))
+            if m:
+                head = escape_html_text(m.group(1))
+                tail = escape_html_text(m.group(2))
+                html_blocks.append(f"<b>{head}</b>\n{tail}".strip())
+            else:
+                html_blocks.append(lines[0])
+            continue
+
+        first_line = lines[0]
+        m = subheading_pattern.match(html.unescape(first_line))
+        if m:
+            head = escape_html_text(m.group(1))
+            tail = escape_html_text(m.group(2))
+            rest = "\n".join(lines[1:])
+            block_html = f"<b>{head}</b>"
+            if tail:
+                block_html += f"\n{tail}"
+            if rest:
+                block_html += f"\n{rest}"
+            html_blocks.append(block_html.strip())
+        else:
+            html_blocks.append("\n".join(lines))
+
+    return "\n\n".join(html_blocks).strip()
 
 
 def format_post_text(
     content: str,
-    referral_url: str,
+    topic: str,
+    post_type: str,
+    service: Optional[Dict[str, Any]],
     photo_credit: Optional[str],
     photo_source_url: Optional[str],
-    topic: str,
 ) -> str:
-    ending = choose_post_ending(topic, referral_url)
+    base_html = convert_plain_text_to_html(content)
+
+    monetization_block = ""
+    if service and should_insert_monetization(post_type):
+        monetization_block = build_native_link_paragraph(service)
+
+    cta = choose_discussion_cta(post_type)
 
     credit_block = ""
     if get_setting("photo_attribution_mode", "0") == "1" and photo_credit:
-        credit_block = f"\n\n{photo_credit}"
+        credit_text = escape_html_text(photo_credit)
+        credit_block = f"\n\n{credit_text}"
         if photo_source_url:
-            credit_block += f"\n{photo_source_url}"
+            credit_block += f'\n<a href="{photo_source_url}">Источник фото</a>'
 
-    base_limit = 1024 - len(ending) - len(credit_block) - 4
-    clean_content = trim_to_limit(content, max(520, base_limit))
+    ending_parts = []
+    if monetization_block:
+        ending_parts.append(monetization_block)
+    if cta:
+        ending_parts.append(escape_html_text(cta))
+    ending_html = "\n\n".join(ending_parts).strip()
 
-    final_text = f"{clean_content}\n\n{ending}{credit_block}".strip()
+    plain_base = re.sub(r"<[^>]+>", "", base_html)
+    plain_ending = re.sub(r"<[^>]+>", "", ending_html)
+    plain_credit = re.sub(r"<[^>]+>", "", credit_block)
 
-    if len(final_text) > 1024:
-        overflow = len(final_text) - 1024
-        clean_content = trim_to_limit(clean_content, max(400, len(clean_content) - overflow - 10))
-        final_text = f"{clean_content}\n\n{ending}{credit_block}".strip()
+    max_base_len = 1024 - len(plain_ending) - len(plain_credit) - 4
+    trimmed_plain_base = trim_to_limit(plain_base, max(350, max_base_len))
+    base_html = convert_plain_text_to_html(trimmed_plain_base)
 
-    return final_text[:1024].strip()
+    final_html = f"{base_html}\n\n{ending_html}{credit_block}".strip() if ending_html else f"{base_html}{credit_block}".strip()
 
+    final_plain = re.sub(r"<[^>]+>", "", final_html)
+    if len(final_plain) > 1024:
+        overflow = len(final_plain) - 1024
+        trimmed_plain_base = trim_to_limit(trimmed_plain_base, max(280, len(trimmed_plain_base) - overflow - 10))
+        base_html = convert_plain_text_to_html(trimmed_plain_base)
+        final_html = f"{base_html}\n\n{ending_html}{credit_block}".strip() if ending_html else f"{base_html}{credit_block}".strip()
 
-def parse_schedule(raw: str) -> List[Tuple[int, int]]:
-    result = []
-    items = [item.strip() for item in raw.split(",") if item.strip()]
-    for item in items:
-        hour_str, minute_str = item.split(":")
-        hour = int(hour_str)
-        minute = int(minute_str)
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            raise ValueError(f"Некорректное время: {item}")
-        result.append((hour, minute))
-    if not result:
-        raise ValueError("Пустое расписание")
-    return result
+    return final_html
 
 
 def save_post(
@@ -513,6 +798,7 @@ def save_post(
     post_type: str,
     content: str,
     referral_url: str,
+    monetization_service: str,
     photo_path: Optional[str],
     photo_credit: Optional[str],
     photo_source_url: Optional[str],
@@ -522,9 +808,10 @@ def save_post(
         cur = conn.execute("""
             INSERT INTO posts(
                 topic, theme_source, goal, post_type, content,
-                referral_url, photo_path, photo_credit, photo_source_url,
+                referral_url, monetization_service,
+                photo_path, photo_credit, photo_source_url,
                 status, created_at, published_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             topic,
             theme_source,
@@ -532,6 +819,7 @@ def save_post(
             post_type,
             content,
             referral_url,
+            monetization_service,
             photo_path,
             photo_credit,
             photo_source_url,
@@ -578,135 +866,13 @@ def get_next_topic() -> Tuple[str, str]:
             return row["topic_text"], row["source_type"]
 
     fallback = random.choice([
-        "Как выбрать тур без переплаты",
-        "Куда уехать на море недорого",
-        "Как найти хороший отель без ошибок",
-        "Что важно знать перед отпуском",
-        "Как сэкономить на путешествии",
+        "5 ошибок при бронировании отпуска",
+        "Как выбрать идеальный отель без разочарований",
+        "Когда лучше покупать билеты",
+        "Что проверить перед поездкой за границу",
+        "Как не переплатить за отдых",
     ])
     return fallback, "fallback"
-
-
-async def generate_post_via_openai(topic: str) -> str:
-    tourjin_url = get_setting("tourjin_bot_url", "https://t.me/TourJin_bot")
-
-    prompt = f"""
-Ты пишешь Telegram-пост для travel-канала «Мир на ладони».
-
-Тема: {topic}
-
-Жёсткие требования:
-- язык: русский
-- стиль: живой, экспертный, дружелюбный
-- текст должен легко читаться с телефона
-- основной текст: строго 700–900 символов
-- итоговый пост после добавления концовки должен быть не длиннее 1024 символов
-- обязательно делай абзацы
-- не делай сплошное полотно текста
-- используй 2–5 уместных эмодзи
-- можно использовать короткие акценты и мини-подзаголовки
-- не используй markdown со звёздочками
-- не пиши слишком длинные предложения
-- не выдумывай факты, цены и обещания
-- текст должен быть законченным, без обрыва
-- текст должен быть оригинальным
-- можно мягко подвести к боту {tourjin_url}, если тема подходит
-- не делай призывов поручить нам индивидуальный подбор
-- не вставляй ссылку в основной текст
-- не пиши пояснений для редактора
-- верни только готовый текст поста
-
-Структура:
-1. короткий заголовок с эмодзи
-2. заход 1–2 предложения
-3. 2–4 коротких абзаца с пользой
-4. короткий вывод
-""".strip()
-
-    response = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.8,
-        max_tokens=900,
-        messages=[
-            {"role": "system", "content": "Ты сильный редактор Telegram-постов про путешествия."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-
-    text = (response.choices[0].message.content or "").strip()
-    if not text:
-        raise ValueError("OpenAI вернул пустой текст")
-
-    return cleanup_post_text(text)
-
-
-async def generate_post_with_retry(topic: str, retries: int = 3, delay: int = 4) -> str:
-    last_error = None
-
-    for attempt in range(1, retries + 1):
-        try:
-            text = await generate_post_via_openai(topic)
-
-            if looks_incomplete(text):
-                raise ValueError("Сгенерированный текст выглядит незавершённым")
-
-            return text
-
-        except Exception as exc:
-            last_error = exc
-            logger.exception(
-                "Ошибка генерации поста | topic=%s | attempt=%s/%s",
-                topic,
-                attempt,
-                retries,
-            )
-            if attempt < retries:
-                await asyncio.sleep(delay)
-
-    raise last_error
-
-
-async def create_post_record(topic: str, source_type: str, goal: str, post_type: str) -> int:
-    content = await generate_post_with_retry(topic)
-    referral_url = choose_referral_url(topic, content)
-    photo_path, photo_credit, photo_source_url = await fetch_pexels_photo(topic)
-
-    post_id = save_post(
-        topic=topic,
-        theme_source=source_type,
-        goal=goal,
-        post_type=post_type,
-        content=content,
-        referral_url=referral_url,
-        photo_path=photo_path,
-        photo_credit=photo_credit,
-        photo_source_url=photo_source_url,
-        status="draft",
-    )
-    return post_id
-
-
-async def publish_post_record(bot, channel_id: str, row, mark_status: str = "published"):
-    text = format_post_text(
-        row["content"],
-        row["referral_url"] or get_setting("default_ref_url", "https://t.me/TourJin_bot"),
-        row["photo_credit"],
-        row["photo_source_url"],
-        row["topic"] or "",
-    )
-
-    photo_path = row["photo_path"]
-    if photo_path and Path(photo_path).exists():
-        with open(photo_path, "rb") as photo_file:
-            await bot.send_photo(
-                chat_id=channel_id,
-                photo=photo_file,
-                caption=text[:1024],
-            )
-    else:
-        await bot.send_message(chat_id=channel_id, text=text)
-
-    update_post_status(row["id"], mark_status)
 
 
 def format_post_card(row) -> str:
@@ -719,12 +885,92 @@ def format_post_card(row) -> str:
         f"Источник темы: {row['theme_source'] or '-'}\n"
         f"Тип: {row['post_type'] or '-'}\n"
         f"Цель: {row['goal'] or '-'}\n"
-        f"Канал: {TELEGRAM_CHANNEL_ID}\n"
         f"Статус: {row['status']}\n"
-        f"Реф-ссылка: {row['referral_url'] or '-'}\n"
+        f"Сервис: {row['monetization_service'] or '-'}\n"
+        f"Ссылка: {'да' if row['referral_url'] else 'нет'}\n"
         f"Фото: {'да' if row['photo_path'] else 'нет'}\n\n"
         f"{row['content']}"
     )
+
+
+async def create_post_record(topic: str, source_type: str, goal: str, forced_post_type: Optional[str] = None) -> int:
+    post_type = forced_post_type or choose_post_type()
+    content = await generate_post_with_retry(topic, post_type)
+
+    service = choose_service(topic, content)
+    should_monetize = bool(service) and should_insert_monetization(post_type)
+
+    referral_url = service["url"] if should_monetize and service else ""
+    monetization_service = service["key"] if should_monetize and service else ""
+
+    photo_path, photo_credit, photo_source_url = await fetch_pexels_photo(topic)
+
+    post_id = save_post(
+        topic=topic,
+        theme_source=source_type,
+        goal=goal,
+        post_type=post_type,
+        content=content,
+        referral_url=referral_url,
+        monetization_service=monetization_service,
+        photo_path=photo_path,
+        photo_credit=photo_credit,
+        photo_source_url=photo_source_url,
+        status="draft",
+    )
+    return post_id
+
+
+async def publish_post_record(bot, channel_id: str, row, mark_status: str = "published"):
+    service = None
+    if row["monetization_service"]:
+        for s in SERVICES:
+            if s["key"] == row["monetization_service"]:
+                service = s
+                break
+
+    text = format_post_text(
+        content=row["content"],
+        topic=row["topic"] or "",
+        post_type=row["post_type"] or "value",
+        service=service,
+        photo_credit=row["photo_credit"],
+        photo_source_url=row["photo_source_url"],
+    )
+
+    photo_path = row["photo_path"]
+    if photo_path and Path(photo_path).exists():
+        with open(photo_path, "rb") as photo_file:
+            await bot.send_photo(
+                chat_id=channel_id,
+                photo=photo_file,
+                caption=text,
+                parse_mode="HTML",
+            )
+    else:
+        await bot.send_message(
+            chat_id=channel_id,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=False,
+        )
+
+    update_post_status(row["id"], mark_status)
+
+
+def parse_schedule(raw: str) -> List[Tuple[int, int]]:
+    result = []
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    for item in items:
+        hour_str, minute_str = item.split(":")
+        hour = int(hour_str)
+        minute = int(minute_str)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(f"Некорректное время: {item}")
+        result.append((hour, minute))
+    if not result:
+        raise ValueError("Пустое расписание")
+    return result
 
 
 async def scheduled_autopost_job(app: Application):
@@ -733,17 +979,22 @@ async def scheduled_autopost_job(app: Application):
         return
 
     logger.info("Запуск scheduled_autopost_job")
-
     topic, source_type = get_next_topic()
     post_id = await create_post_record(
         topic=topic,
         source_type=source_type,
-        goal="trust",
-        post_type="auto",
+        goal="autopost",
+        forced_post_type=None,
     )
     row = get_post(post_id)
     await publish_post_record(app.bot, TELEGRAM_CHANNEL_ID, row, mark_status="published")
-    logger.info("Автопост опубликован | id=%s | topic=%s", post_id, topic)
+    logger.info(
+        "Автопост опубликован | id=%s | topic=%s | type=%s | service=%s",
+        post_id,
+        topic,
+        row["post_type"],
+        row["monetization_service"],
+    )
 
 
 def rebuild_scheduler(app: Application):
@@ -794,9 +1045,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/test_post [id] — тест конкретного поста\n"
         "/topic_add текст — добавить тему\n"
         "/topics — показать темы\n"
-        "/partners — показать партнёрские ссылки\n"
-        "/partner_add name | keywords | url — добавить партнёрскую ссылку\n"
-        "/set_tourjin https://t.me/TourJin_bot — обновить ссылку\n"
         "/set_test_channel @my_test_channel — обновить тестовый канал"
     )
 
@@ -820,8 +1068,8 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     post_id = await create_post_record(
         topic=topic,
         source_type=source_type,
-        goal="trust",
-        post_type="expert",
+        goal="manual",
+        forced_post_type=None,
     )
     row = get_post(post_id)
 
@@ -917,7 +1165,7 @@ async def test_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             topic="Тестовый пост для проверки канала",
             source_type="test",
             goal="test",
-            post_type="test",
+            forced_post_type="experimental",
         )
         row = get_post(post_id)
 
@@ -1002,63 +1250,6 @@ async def topic_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-async def partners_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with closing(db()) as conn:
-        rows = conn.execute(
-            "SELECT id, name, keywords, url, marker, is_active FROM partners ORDER BY id DESC"
-        ).fetchall()
-
-    if not rows:
-        await safe_reply(update, "Партнёрских ссылок пока нет.")
-        return
-
-    text = "Партнёрские ссылки:\n\n"
-    for row in rows:
-        text += (
-            f"{row['id']}. {row['name']}\n"
-            f"keywords: {row['keywords']}\n"
-            f"url: {row['url']}\n"
-            f"marker: {row['marker']}\n"
-            f"active: {row['is_active']}\n\n"
-        )
-    text += "Добавить: /partner_add name | keywords | url"
-    await safe_reply(update, text)
-
-
-@admin_only
-async def partner_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.replace("/partner_add", "", 1).strip()
-    parts = [p.strip() for p in raw.split("|")]
-
-    if len(parts) < 3:
-        await safe_reply(update, "Пример: /partner_add TourJin | тур,отпуск,отель | https://t.me/TourJin_bot")
-        return
-
-    name, keywords, url = parts[0], parts[1], parts[2]
-
-    with closing(db()) as conn:
-        conn.execute("""
-            INSERT INTO partners(name, keywords, url, marker, is_active)
-            VALUES (?, ?, ?, '', 1)
-        """, (name, keywords, url))
-        conn.commit()
-
-    await safe_reply(update, f"Партнёрская ссылка добавлена: {name}")
-
-
-@admin_only
-async def set_tourjin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await safe_reply(update, "Пример: /set_tourjin https://t.me/TourJin_bot")
-        return
-
-    url = context.args[0].strip()
-    set_setting("tourjin_bot_url", url)
-    set_setting("default_ref_url", url)
-    await safe_reply(update, f"Ссылка TourJin обновлена: {url}")
-
-
-@admin_only
 async def set_test_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await safe_reply(update, "Пример: /set_test_channel @my_test_channel")
@@ -1109,9 +1300,6 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("test_post", test_post_cmd))
     app.add_handler(CommandHandler("topics", topics_cmd))
     app.add_handler(CommandHandler("topic_add", topic_add_cmd))
-    app.add_handler(CommandHandler("partners", partners_cmd))
-    app.add_handler(CommandHandler("partner_add", partner_add_cmd))
-    app.add_handler(CommandHandler("set_tourjin", set_tourjin_cmd))
     app.add_handler(CommandHandler("set_test_channel", set_test_channel_cmd))
 
     app.add_error_handler(error_handler)
