@@ -1,9 +1,66 @@
-# ====== НОВАЯ СИСТЕМА ШАБЛОНОВ ======
+import asyncio
+import html
+import logging
+import os
+import random
+import re
+import sqlite3
+from contextlib import closing
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Optional, List, Tuple, Dict, Any
 
-POST_TEMPLATES = {
-    "value": 12,
+import httpx
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.error import Forbidden
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+load_dotenv()
+
+APP_VERSION = "travel-matrix-v6-15-templates"
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
+TEST_CHANNEL_ID = os.getenv("TEST_CHANNEL_ID", "").strip()
+TELEGRAM_ADMIN_ID_RAW = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
+DEFAULT_POST_TIMES = os.getenv("POST_TIMES", "09:00,14:00,19:00").strip()
+
+BOT_TZ = timezone(timedelta(hours=3))
+TELEGRAM_ADMIN_ID = int(TELEGRAM_ADMIN_ID_RAW) if TELEGRAM_ADMIN_ID_RAW else None
+
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN")
+if not TELEGRAM_CHANNEL_ID:
+    raise RuntimeError("Не задан TELEGRAM_CHANNEL_ID")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Не задан OPENAI_API_KEY")
+
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "bot.db"
+PHOTOS_DIR = BASE_DIR / "photos"
+CACHE_DIR = PHOTOS_DIR / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("mirnaladoni_bot")
+
+scheduler_instance: Optional[AsyncIOScheduler] = None
+
+# 12 базовых шаблонов + 3 специальных сценария по расписанию
+POST_TEMPLATES: Dict[str, int] = {
+    "useful": 12,
     "mistake": 12,
-    "list": 10,
+    "selection": 10,
     "engagement": 10,
     "provocation": 5,
     "trust": 8,
@@ -11,166 +68,1738 @@ POST_TEMPLATES = {
     "seasonal": 8,
     "case": 7,
     "selling": 12,
-    "poll": 3,
+    "mini_poll": 3,
     "short": 3,
 }
 
-NO_LINK_TYPES = {"engagement", "provocation", "trust", "poll"}
-FORCE_LINK_TYPES = {"selling", "list", "value", "expert", "mistake", "seasonal"}
+SPECIAL_TEMPLATES = {
+    "special_low_price_map",
+    "special_hot_tours",
+    "special_hotels_discount",
+}
 
-CTA_TYPES = [
-    "save",
-    "comment",
-    "choice",
-    "share",
-    "subscribe",
-    "soft_sell",
-    "no_cta",
+TEMPLATE_LENGTH_CLASS = {
+    "short": "short",
+    "mini_poll": "short",
+    "engagement": "short",
+    "provocation": "short",
+    "useful": "medium",
+    "mistake": "medium",
+    "trust": "medium",
+    "seasonal": "medium",
+    "case": "medium",
+    "selection": "long",
+    "expert": "long",
+    "selling": "long",
+    "special_low_price_map": "medium",
+    "special_hot_tours": "medium",
+    "special_hotels_discount": "medium",
+}
+
+LENGTH_RANGES = {
+    "short": (300, 550),
+    "medium": (550, 850),
+    "long": (700, 950),
+}
+
+STYLE_VARIANTS = {
+    "useful": ["полезный практический", "чек-лист", "быстрая инструкция"],
+    "mistake": ["ошибка / антиошибка", "разбор типичной ошибки"],
+    "selection": ["подборка", "рейтинг", "сравнение вариантов"],
+    "engagement": ["вовлекающий вопрос", "обсуждение", "выбор"],
+    "provocation": ["провокационный тезис", "спорное мнение"],
+    "trust": ["доверительный пост", "личное наблюдение"],
+    "expert": ["экспертный разбор", "неочевидимый нюанс"],
+    "seasonal": ["сезонный пост", "ситуативный пост"],
+    "case": ["мини-кейс", "история ситуации"],
+    "selling": ["продающий мягкий пост", "решение проблемы"],
+    "mini_poll": ["мини-анкета", "быстрый опрос"],
+    "short": ["короткий ситуативный пост", "короткое наблюдение"],
+    "special_low_price_map": ["спецпост про карту низких цен"],
+    "special_hot_tours": ["спецпост про горящие туры"],
+    "special_hotels_discount": ["спецпост про отели со скидкой"],
+}
+
+NO_LINK_TEMPLATES = {"engagement", "provocation", "trust", "mini_poll"}
+OPTIONAL_LINK_TEMPLATES = {"useful", "selection", "expert", "mistake", "seasonal", "case", "short"}
+FORCED_LINK_TEMPLATES = {"selling", "special_low_price_map", "special_hot_tours", "special_hotels_discount"}
+
+SERVICES: List[Dict[str, Any]] = [
+    {
+        "key": "ostrovok",
+        "name": "Ostrovok",
+        "category": "hotels",
+        "url": "https://ostrovok.tp.st/yHBoZUg7",
+        "keywords": ["отель", "отели", "гостиница", "гостиницы", "жилье", "жильё", "проживание", "апартаменты"],
+        "anchor_options": ["отели и цены", "варианты проживания", "подходящее жильё"],
+        "priority": 10,
+        "is_active": True,
+    },
+    {
+        "key": "yandex_travel",
+        "name": "Yandex Travel",
+        "category": "general_travel",
+        "url": "https://yandex.tp.st/y94GSOah",
+        "keywords": ["путешествие", "поездка", "отдых", "маршрут"],
+        "anchor_options": ["варианты поездки", "варианты отдыха", "удобные варианты"],
+        "priority": 3,
+        "is_active": True,
+    },
+    {
+        "key": "aviasales",
+        "name": "Aviasales",
+        "category": "flights",
+        "url": "https://aviasales.tp.st/hYipm2Ac",
+        "keywords": ["билет", "билеты", "авиабилет", "авиабилеты", "самолет", "самолёт", "перелет", "перелёт", "рейс"],
+        "anchor_options": ["авиабилеты", "варианты перелёта", "билеты на перелёт"],
+        "priority": 10,
+        "is_active": True,
+    },
+    {
+        "key": "vip_zal",
+        "name": "VIP Zal",
+        "category": "airport",
+        "url": "https://vip-zal.tp.st/VUTiM7FJ",
+        "keywords": ["лаунж", "бизнес-зал", "бизнес зал", "зал ожидания", "аэропорт", "долгая пересадка"],
+        "anchor_options": ["доступ в лаунж", "варианты бизнес-залов", "лаунж-залы в аэропорту"],
+        "priority": 6,
+        "is_active": True,
+    },
+    {
+        "key": "onlinetours",
+        "name": "Onlinetours",
+        "category": "tours",
+        "url": "https://onlinetours.tp.st/Um2ycow9",
+        "keywords": ["тур", "туры", "путевка", "путёвка", "пакетный тур", "all inclusive"],
+        "anchor_options": ["варианты тура", "туры по направлению", "пакетные туры"],
+        "priority": 9,
+        "is_active": True,
+    },
+    {
+        "key": "travelata",
+        "name": "Travelata",
+        "category": "tours",
+        "url": "https://travelata.tp.st/O6m2Lg6H",
+        "keywords": ["горящий тур", "горящие туры", "тур", "туры", "спецпредложения"],
+        "anchor_options": ["горящие туры", "туры со скидкой", "интересные туры"],
+        "priority": 9,
+        "is_active": True,
+    },
+    {
+        "key": "tutu",
+        "name": "Tutu",
+        "category": "ground_transport",
+        "url": "https://tutu.tp.st/dZglLc7q",
+        "keywords": ["поезд", "поезда", "автобус", "автобусы", "электричка", "жд", "переезд"],
+        "anchor_options": ["билеты на транспорт", "варианты переезда", "билеты на поезд или автобус"],
+        "priority": 8,
+        "is_active": True,
+    },
+    {
+        "key": "rail_europe",
+        "name": "Rail Europe",
+        "category": "rail_europe",
+        "url": "https://raileurope.tp.st/nWODZ4nI",
+        "keywords": ["европа", "поезд по европе", "поезда европы", "железная дорога европа"],
+        "anchor_options": ["жд билеты по Европе", "поезда по Европе", "европейские маршруты"],
+        "priority": 7,
+        "is_active": True,
+    },
+    {
+        "key": "cherehapa",
+        "name": "Cherehapa",
+        "category": "insurance",
+        "url": "https://cherehapa.tp.st/RIsddc4I",
+        "keywords": ["страховка", "страхование", "полис", "страховой"],
+        "anchor_options": ["страховку для поездки", "варианты страховки", "подходящий страховой полис"],
+        "priority": 10,
+        "is_active": True,
+    },
+    {
+        "key": "kiwitaxi",
+        "name": "KiwiTaxi",
+        "category": "transfer",
+        "url": "https://kiwitaxi.tp.st/Ven9kvYz",
+        "keywords": ["трансфер", "из аэропорта", "в аэропорт", "после прилёта", "поздний прилёт"],
+        "anchor_options": ["трансфер из аэропорта", "варианты трансфера", "поездку из аэропорта"],
+        "priority": 9,
+        "is_active": True,
+    },
+    {
+        "key": "localrent",
+        "name": "Localrent",
+        "category": "car_rental",
+        "url": "https://localrent.tp.st/Q77W1ZWX",
+        "keywords": ["аренда авто", "машина", "авто", "прокат авто", "арендовать машину"],
+        "anchor_options": ["аренду авто", "варианты проката авто", "машину для поездки"],
+        "priority": 9,
+        "is_active": True,
+    },
+    {
+        "key": "bikesbooking",
+        "name": "BikesBooking",
+        "category": "bike_rental",
+        "url": "https://bikesbooking.tp.st/eMN1TXvi",
+        "keywords": ["байк", "скутер", "мотоцикл", "мопед", "багги"],
+        "anchor_options": ["прокат байка или скутера", "двухколёсный транспорт", "прокат скутера"],
+        "priority": 7,
+        "is_active": True,
+    },
+    {
+        "key": "sputnik8",
+        "name": "Sputnik8",
+        "category": "excursions",
+        "url": "https://sputnik8.tp.st/FQZC0UxF",
+        "keywords": ["экскурсия", "экскурсии", "гид", "что посмотреть", "достопримечательности", "прогулка"],
+        "anchor_options": ["экскурсии по месту", "что посмотреть на месте", "варианты экскурсий"],
+        "priority": 9,
+        "is_active": True,
+    },
+    {
+        "key": "ticketnetwork",
+        "name": "TicketNetwork",
+        "category": "events",
+        "url": "https://ticketnetwork.tp.st/evSOqzXe",
+        "keywords": ["концерт", "шоу", "мероприятие", "событие", "матч", "спектакль"],
+        "anchor_options": ["билеты на мероприятия", "события по направлению", "интересные мероприятия"],
+        "priority": 7,
+        "is_active": True,
+    },
+    {
+        "key": "trip_cruises",
+        "name": "Trip",
+        "category": "cruises",
+        "url": "https://www.trip.com/t/OjTmFMTwFU2",
+        "keywords": ["круиз", "круизы", "лайнер"],
+        "anchor_options": ["варианты круизов", "круизы по направлению", "подходящий круиз"],
+        "priority": 6,
+        "is_active": True,
+    },
+    {
+        "key": "tourjin_bot",
+        "name": "TourJin Bot",
+        "category": "general_bot",
+        "url": "https://t.me/TourJin_bot",
+        "keywords": ["куда поехать", "что выбрать", "общий подбор", "подобрать поездку", "подобрать отдых"],
+        "anchor_options": ["удобный подбор поездки", "варианты под запрос", "идеи поездки"],
+        "priority": 2,
+        "is_active": True,
+    },
 ]
 
-# ====== ВЫБОР ТИПА ПОСТА ======
+TOPIC_GROUP_RULES = {
+    "hotels": ["отель", "отели", "гостиница", "гостиницы", "жилье", "жильё", "проживание", "апартаменты"],
+    "flights": ["билет", "билеты", "авиабилет", "авиабилеты", "перелет", "перелёт", "самолет", "самолёт", "рейс"],
+    "tours": ["тур", "туры", "путевка", "путёвка", "горящий тур", "горящие туры", "all inclusive"],
+    "insurance": ["страховка", "страхование", "полис", "страховой"],
+    "transfer": ["трансфер", "из аэропорта", "в аэропорт", "поздний прилёт", "после прилёта"],
+    "car_rental": ["аренда авто", "машина", "прокат авто", "арендовать машину"],
+    "bike_rental": ["байк", "скутер", "мотоцикл", "мопед", "багги"],
+    "excursions": ["экскурсия", "экскурсии", "гид", "что посмотреть", "достопримечательности", "прогулка"],
+    "events": ["концерт", "шоу", "мероприятие", "событие", "матч", "спектакль"],
+    "cruises": ["круиз", "круизы", "лайнер"],
+    "ground_transport": ["поезд", "поезда", "автобус", "автобусы", "электричка", "жд", "переезд"],
+    "rail_europe": ["европа", "поезд по европе", "поезда европы"],
+    "airport": ["лаунж", "бизнес-зал", "зал ожидания", "пересадка", "аэропорт"],
+    "general_bot": ["куда поехать", "что выбрать", "подобрать поездку", "подобрать отдых"],
+}
 
-def choose_post_template():
-    total = sum(POST_TEMPLATES.values())
-    rnd = random.randint(1, total)
+CTA_CLASSES = {
+    "save": [
+        "Сохрани, чтобы не потерять.",
+        "Лучше оставить себе, чем потом искать заново.",
+    ],
+    "comment": [
+        "Что бы ты сюда добавил?",
+        "У тебя было что-то похожее?",
+    ],
+    "choice": [
+        "А вы бы что выбрали?",
+        "Для вас важнее цена или комфорт?",
+    ],
+    "share": [
+        "Отправь тому, кто сейчас планирует поездку.",
+        "Поделись с тем, кому это может пригодиться.",
+    ],
+    "subscribe": [
+        "Подпишись, если нужны ещё такие разборы.",
+        "В канале ещё будут такие короткие travel-разборы.",
+    ],
+    "soft_sell": [
+        "Если вопрос уже актуален, удобнее проверить варианты заранее.",
+        "Когда тема горит, лучше быстро сравнить всё в одном месте.",
+    ],
+    "none": [
+        "Иногда одна проверка экономит весь отпуск.",
+        "На таких мелочах поездка и собирается.",
+    ],
+}
 
-    cumulative = 0
-    for key, weight in POST_TEMPLATES.items():
-        cumulative += weight
-        if rnd <= cumulative:
-            return key
-    return "value"
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-# ====== ДЛИНА ======
-
-def get_length_range(template):
-    if template in {"short", "poll", "engagement"}:
-        return (300, 550)
-    elif template in {"list", "expert", "selling"}:
-        return (700, 950)
-    else:
-        return (550, 850)
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-# ====== CTA ======
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    names = {col[1] for col in cols}
+    if column not in names:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
-def choose_cta(template):
-    mapping = {
+
+def init_db():
+    with closing(db()) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS posts(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT,
+                theme_source TEXT,
+                goal TEXT,
+                post_type TEXT,
+                content TEXT NOT NULL,
+                referral_url TEXT,
+                monetization_service TEXT,
+                photo_path TEXT,
+                photo_credit TEXT,
+                photo_source_url TEXT,
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_at TEXT NOT NULL,
+                published_at TEXT
+            )
+        """)
+
+        ensure_column(conn, "posts", "referral_url", "TEXT")
+        ensure_column(conn, "posts", "monetization_service", "TEXT")
+        ensure_column(conn, "posts", "photo_path", "TEXT")
+        ensure_column(conn, "posts", "photo_credit", "TEXT")
+        ensure_column(conn, "posts", "photo_source_url", "TEXT")
+        ensure_column(conn, "posts", "status", "TEXT NOT NULL DEFAULT 'draft'")
+        ensure_column(conn, "posts", "published_at", "TEXT")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings(
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS topics(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic_text TEXT NOT NULL,
+                source_type TEXT DEFAULT 'manual',
+                source_name TEXT DEFAULT '',
+                used INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS content_stats(
+                post_type TEXT PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+        conn.commit()
+
+    ensure_default_settings()
+    ensure_default_topics()
+    ensure_default_content_stats()
+
+
+def ensure_default_content_stats():
+    with closing(db()) as conn:
+        for post_type in POST_TEMPLATES.keys():
+            conn.execute(
+                """
+                INSERT INTO content_stats(post_type, count)
+                VALUES(?, 0)
+                ON CONFLICT(post_type) DO NOTHING
+                """,
+                (post_type,),
+            )
+        conn.commit()
+
+
+def increment_post_type_stat(post_type: str):
+    if post_type in SPECIAL_TEMPLATES:
+        return
+    with closing(db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO content_stats(post_type, count)
+            VALUES(?, 1)
+            ON CONFLICT(post_type) DO UPDATE SET count = count + 1
+            """,
+            (post_type,),
+        )
+        conn.commit()
+
+
+def get_content_stats() -> Dict[str, int]:
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT post_type, count FROM content_stats").fetchall()
+    stats = {row["post_type"]: row["count"] for row in rows}
+    for post_type in POST_TEMPLATES.keys():
+        stats.setdefault(post_type, 0)
+    return stats
+
+
+def set_setting(key: str, value: str):
+    with closing(db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO settings(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, value),
+        )
+        conn.commit()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def ensure_default_settings():
+    defaults = {
+        "autopost_enabled": "1",
+        "post_times": DEFAULT_POST_TIMES or "09:00,14:00,19:00",
+        "test_channel_id": TEST_CHANNEL_ID,
+        "photo_attribution_mode": "0",
+        "pexels_orientation": "landscape",
+        "pexels_size": "large",
+        "pexels_per_page": "10",
+    }
+    for key, value in defaults.items():
+        if get_setting(key, "") == "":
+            set_setting(key, value)
+
+
+def ensure_default_topics():
+    default_topics = [
+        "5 ошибок при бронировании отпуска",
+        "Как выбрать идеальный отель без разочарований",
+        "Когда лучше покупать билеты",
+        "Что проверить перед поездкой за границу",
+        "Как не переплатить за отдых",
+        "Как выбрать страховку в поездку",
+        "Что важно знать про трансфер из аэропорта",
+        "Где туристы чаще всего теряют деньги в отпуске",
+        "Как не испортить первый день отдыха",
+        "Куда поехать на море недорого",
+        "Как сэкономить на экскурсиях",
+        "Семейный отдых: что важно предусмотреть заранее",
+        "Почему дешёвый тур иногда выходит дороже",
+        "Как не ошибиться с отелем в первый раз",
+        "Нужна ли страховка, если летишь всего на неделю",
+    ]
+    with closing(db()) as conn:
+        count = conn.execute("SELECT COUNT(*) AS c FROM topics").fetchone()["c"]
+        if count == 0:
+            for topic in default_topics:
+                conn.execute(
+                    """
+                    INSERT INTO topics(topic_text, source_type, source_name, used, created_at)
+                    VALUES(?, 'default', 'system', 0, ?)
+                    """,
+                    (topic, now_iso()),
+                )
+            conn.commit()
+
+
+def is_admin(user_id: Optional[int]) -> bool:
+    if TELEGRAM_ADMIN_ID is None:
+        return True
+    return user_id == TELEGRAM_ADMIN_ID
+
+
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id if update.effective_user else None
+        if not is_admin(user_id):
+            await safe_reply(update, "Доступ запрещён.")
+            return
+        return await func(update, context)
+    return wrapper
+
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            ["/gen", "/last", "/version"],
+            ["/schedule", "/autopost_on", "/autopost_off"],
+            ["/test_channel", "/topics", "/menu"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+async def safe_reply(update: Update, text: str):
+    if update.message:
+        await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+    elif update.effective_chat:
+        await update.get_bot().send_message(
+            chat_id=update.effective_chat.id,
+            text=text,
+            reply_markup=main_menu_keyboard(),
+        )
+
+
+def normalize_text(text: str) -> str:
+    return (text or "").lower().strip()
+
+
+def escape_html_text(text: str) -> str:
+    return html.escape(text or "", quote=False)
+
+
+def slugify(text: str, max_len: int = 60) -> str:
+    text = text.lower().strip()
+    text = text.replace("ё", "e")
+    text = re.sub(r"[^a-zA-Zа-яА-Я0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text[:max_len] or "photo"
+
+
+def cleanup_post_text(text: str) -> str:
+    text = text.replace("***", "").replace("**", "").replace("__", "")
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"^([^\w\s])(\d)", r"\1 \2", text)
+    return text.strip()
+
+
+def looks_incomplete(text: str) -> bool:
+    stripped = text.strip()
+    if len(stripped) < 260:
+        return True
+    if stripped.endswith((":", ",", ";", "—", "-", "…")):
+        return True
+    last_line = stripped.splitlines()[-1].strip()
+    if stripped and stripped[-1].isalnum() and len(last_line.split()) <= 2:
+        return True
+    return False
+
+
+def trim_to_limit(text: str, max_len: int) -> str:
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+    shortened = text[:max_len].rstrip()
+    last_break = max(
+        shortened.rfind("\n"),
+        shortened.rfind(". "),
+        shortened.rfind("! "),
+        shortened.rfind("? "),
+    )
+    if last_break > max_len * 0.6:
+        shortened = shortened[:last_break + 1].rstrip()
+    return shortened.rstrip(" ,;:-") + "…"
+
+
+def get_recent_posts(limit: int = 7):
+    with closing(db()) as conn:
+        return conn.execute(
+            """
+            SELECT id, topic, post_type, monetization_service, content, created_at
+            FROM posts
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def get_last_post():
+    with closing(db()) as conn:
+        return conn.execute("SELECT * FROM posts ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def get_post(post_id: int):
+    with closing(db()) as conn:
+        return conn.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+
+
+def get_next_topic() -> Tuple[str, str]:
+    with closing(db()) as conn:
+        row = conn.execute("""
+            SELECT * FROM topics
+            WHERE used=0
+            ORDER BY id ASC
+            LIMIT 1
+        """).fetchone()
+
+        if row:
+            conn.execute("UPDATE topics SET used=1 WHERE id=?", (row["id"],))
+            conn.commit()
+            return row["topic_text"], row["source_type"]
+
+    fallback = random.choice([
+        "5 ошибок при бронировании отпуска",
+        "Как выбрать идеальный отель без разочарований",
+        "Когда лучше покупать билеты",
+        "Что проверить перед поездкой за границу",
+        "Как не переплатить за отдых",
+    ])
+    return fallback, "fallback"
+
+
+def parse_schedule(raw: str) -> List[Tuple[int, int]]:
+    result = []
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    for item in items:
+        hour_str, minute_str = item.split(":")
+        hour = int(hour_str)
+        minute = int(minute_str)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(f"Некорректное время: {item}")
+        result.append((hour, minute))
+    if not result:
+        raise ValueError("Пустое расписание")
+    return sorted(result)
+
+
+def get_today_post_slot(now_dt: datetime, schedule_raw: str) -> int:
+    times = parse_schedule(schedule_raw)
+    current_minutes = now_dt.hour * 60 + now_dt.minute
+
+    for idx, (h, m) in enumerate(times, start=1):
+        if h * 60 + m == current_minutes:
+            return idx
+
+    passed = [1 for h, m in times if h * 60 + m <= current_minutes]
+    if passed:
+        return len(passed)
+    return 1
+
+
+def choose_post_template() -> str:
+    stats = get_content_stats()
+    total = sum(stats.values())
+    recent = get_recent_posts(5)
+    recent_types = [row["post_type"] for row in recent if row["post_type"] and row["post_type"] in POST_TEMPLATES]
+
+    if total == 0:
+        weighted = []
+        for template, weight in POST_TEMPLATES.items():
+            weighted.extend([template] * weight)
+        return random.choice(weighted)
+
+    deficits = {}
+    for template, target_pct in POST_TEMPLATES.items():
+        actual_pct = (stats.get(template, 0) / total) * 100 if total else 0
+        deficits[template] = target_pct - actual_pct
+
+    for template in list(deficits.keys()):
+        if recent_types and recent_types[0] == template:
+            deficits[template] -= 25
+        if recent_types.count(template) >= 2:
+            deficits[template] -= 10
+        if template == "selling" and recent_types and recent_types[0] == "selling":
+            deficits[template] -= 30
+
+    best = max(deficits.values())
+    candidates = [k for k, v in deficits.items() if v == best]
+    return random.choice(candidates)
+
+
+def get_length_range(template: str) -> Tuple[int, int]:
+    length_class = TEMPLATE_LENGTH_CLASS.get(template, "medium")
+    return LENGTH_RANGES[length_class]
+
+
+def recent_posts_have_links(recent_posts, lookback: int = 1) -> bool:
+    return any((row["monetization_service"] or "").strip() for row in recent_posts[:lookback])
+
+
+def recent_tourjin_count(recent_posts, lookback: int = 4) -> int:
+    return sum(1 for row in recent_posts[:lookback] if (row["monetization_service"] or "") == "tourjin_bot")
+
+
+def should_insert_links(template: str, recent_posts) -> bool:
+    if template in NO_LINK_TEMPLATES:
+        return False
+    if recent_posts_have_links(recent_posts, lookback=1):
+        return False
+    if template in FORCED_LINK_TEMPLATES:
+        return True
+    if template in OPTIONAL_LINK_TEMPLATES:
+        return random.random() < 0.55
+    return False
+
+
+def topic_groups(topic: str, content: str = "") -> List[str]:
+    topic_text = normalize_text(topic)
+    content_text = normalize_text(content)
+
+    scores: Dict[str, int] = {}
+    for group, keywords in TOPIC_GROUP_RULES.items():
+        score = 0
+        for kw in keywords:
+            if kw in topic_text:
+                score += 3
+            if kw in content_text:
+                score += 1
+        if score > 0:
+            scores[group] = score
+
+    if not scores:
+        return []
+
+    max_score = max(scores.values())
+    winners = [group for group, score in scores.items() if score == max_score]
+    return winners
+
+
+def build_service_candidates(groups: List[str]) -> List[Dict[str, Any]]:
+    matches = [s for s in SERVICES if s["is_active"] and s["category"] in groups]
+    matches.sort(key=lambda x: x["priority"], reverse=True)
+    return matches
+
+
+def choose_services(topic: str, content: str, template: str, recent_posts) -> List[Dict[str, Any]]:
+    if not should_insert_links(template, recent_posts):
+        return []
+
+    groups = topic_groups(topic, content)
+    if not groups:
+        return []
+
+    candidates = build_service_candidates(groups)
+    if not candidates:
+        return []
+
+    last_service = (recent_posts[0]["monetization_service"] or "") if recent_posts else ""
+    filtered = [s for s in candidates if s["key"] != last_service]
+    if filtered:
+        candidates = filtered
+
+    # TourJin только для общей темы и не чаще 1 раза в 4 поста
+    final_candidates = []
+    for s in candidates:
+        if s["key"] == "tourjin_bot":
+            if "general_bot" not in groups:
+                continue
+            if recent_tourjin_count(recent_posts, lookback=4) >= 1:
+                continue
+        final_candidates.append(s)
+
+    if final_candidates:
+        candidates = final_candidates
+
+    if not candidates:
+        return []
+
+    chosen: List[Dict[str, Any]] = [candidates[0]]
+
+    # максимум 2 ссылки в посте, вторую добавляем редко и только в подборках/продающих/сезонных
+    if template in {"selection", "selling", "seasonal"} and len(candidates) > 1 and random.random() < 0.35:
+        for candidate in candidates[1:]:
+            if candidate["key"] != chosen[0]["key"]:
+                chosen.append(candidate)
+                break
+
+    return chosen[:2]
+
+
+def choose_cta_class(template: str, recent_posts) -> str:
+    preferred = {
+        "selling": ["soft_sell", "share", "subscribe"],
         "engagement": ["choice", "comment"],
-        "provocation": ["comment"],
-        "trust": ["no_cta"],
-        "poll": ["choice"],
-        "selling": ["soft_sell", "share"],
+        "mini_poll": ["choice"],
+        "provocation": ["comment", "choice"],
+        "trust": ["none", "comment"],
+        "expert": ["comment", "save"],
+        "selection": ["choice", "share"],
+        "useful": ["save", "comment", "share"],
+        "mistake": ["save", "comment"],
+        "seasonal": ["save", "soft_sell"],
+        "case": ["comment", "share"],
+        "short": ["save", "none"],
+        "special_low_price_map": ["soft_sell", "share"],
+        "special_hot_tours": ["soft_sell", "share"],
+        "special_hotels_discount": ["soft_sell", "share"],
     }
-    return random.choice(mapping.get(template, CTA_TYPES))
+
+    recent_text = " ".join((row["content"] or "")[-150:] for row in recent_posts[:3])
+    options = preferred.get(template, ["save", "comment", "none"])
+    filtered = [o for o in options if not any(cta in recent_text for cta in CTA_CLASSES[o])]
+    return random.choice(filtered or options)
 
 
-def build_cta(cta_type):
-    ctas = {
-        "save": ["Сохрани, чтобы не потерять."],
-        "comment": ["Что думаешь по этому поводу?"],
-        "choice": ["А ты бы что выбрал?"],
-        "share": ["Отправь тому, кому это пригодится."],
-        "subscribe": ["Подпишись, если тема откликается."],
-        "soft_sell": ["Если тема актуальна — лучше проверить заранее."],
-        "no_cta": [""],
+def build_cta(template: str, recent_posts) -> str:
+    cta_class = choose_cta_class(template, recent_posts)
+    options = CTA_CLASSES[cta_class]
+    recent_text = " ".join((row["content"] or "")[-150:] for row in recent_posts[:3])
+    filtered = [o for o in options if o not in recent_text]
+    return random.choice(filtered or options)
+
+
+def choose_anchor_text(service: Dict[str, Any]) -> str:
+    return random.choice(service["anchor_options"])
+
+
+def build_native_link_paragraph(service: Dict[str, Any], template: str) -> str:
+    url = service["url"]
+    anchor = escape_html_text(choose_anchor_text(service))
+
+    base_templates = {
+        "hotels": [
+            f'Если хочется спокойно сравнить варианты — можно посмотреть <a href="{url}">{anchor}</a>.',
+            f'Обычно такие вещи удобнее проверять через <a href="{url}">{anchor}</a>.',
+        ],
+        "tours": [
+            f'Когда вопрос уже актуален, проще заранее посмотреть <a href="{url}">{anchor}</a>.',
+            f'Часто выгоднее сначала сравнить <a href="{url}">{anchor}</a>.',
+        ],
+        "flights": [
+            f'Иногда дешевле просто заранее проверить <a href="{url}">{anchor}</a>.',
+            f'В такие моменты лучше быстро открыть <a href="{url}">{anchor}</a>.',
+        ],
+        "insurance": [
+            f'Перед вылетом лучше один раз проверить <a href="{url}">{anchor}</a>.',
+            f'В подобных случаях разумнее заранее открыть <a href="{url}">{anchor}</a>.',
+        ],
+        "excursions": [
+            f'Если хотите не потерять хорошие варианты, можно заранее посмотреть <a href="{url}">{anchor}</a>.',
+            f'Часто удобнее заранее выбрать <a href="{url}">{anchor}</a>.',
+        ],
+        "transfer": [
+            f'После позднего прилёта спокойнее заранее проверить <a href="{url}">{anchor}</a>.',
+            f'Чтобы не метаться на месте, можно заранее открыть <a href="{url}">{anchor}</a>.',
+        ],
+        "car_rental": [
+            f'В таких поездках часто удобнее заранее сравнить <a href="{url}">{anchor}</a>.',
+            f'Если маршрут плотный, лучше сразу посмотреть <a href="{url}">{anchor}</a>.',
+        ],
+        "ground_transport": [
+            f'Иногда проще заранее проверить <a href="{url}">{anchor}</a>.',
+            f'В таких маршрутах стоит заранее открыть <a href="{url}">{anchor}</a>.',
+        ],
+        "general_bot": [
+            f'Если хочется быстро сориентироваться, можно открыть <a href="{url}">{anchor}</a>.',
+            f'Когда нужен общий подбор, удобнее посмотреть <a href="{url}">{anchor}</a>.',
+        ],
     }
-    return random.choice(ctas[cta_type])
+
+    category = service["category"]
+    options = base_templates.get(category, [
+        f'Если тема актуальна, удобно заранее проверить <a href="{url}">{anchor}</a>.',
+        f'Чтобы не тратить время на хаотичный поиск, можно открыть <a href="{url}">{anchor}</a>.',
+    ])
+
+    if template == "selling":
+        options = [
+            f'Когда вопрос уже актуален, проще сразу посмотреть <a href="{url}">{anchor}</a>.',
+            f'Если не хочется терять время на лишние сравнения, можно быстро проверить <a href="{url}">{anchor}</a>.',
+        ] + options
+
+    return random.choice(options)
 
 
-# ====== ЛОГИКА ССЫЛОК ======
+def build_pexels_queries(topic: str) -> List[str]:
+    topic_lower = normalize_text(topic)
+    base = [
+        topic_lower,
+        f"{topic_lower} travel",
+        f"{topic_lower} vacation",
+        f"{topic_lower} tourism",
+    ]
 
-def should_add_link(template, recent_posts):
-    if template in NO_LINK_TYPES:
-        return False
+    mappings = [
+        (["турция", "turkey"], ["turkey beach resort", "antalya resort"]),
+        (["егип", "egypt"], ["egypt resort sea", "egypt beach vacation"]),
+        (["таиланд", "thai", "thailand"], ["thailand beach resort", "phuket travel"]),
+        (["отель", "hotel"], ["hotel room travel", "resort hotel"]),
+        (["море", "пляж"], ["beach resort", "sea vacation"]),
+        (["семей", "дет"], ["family vacation beach", "family travel"]),
+        (["роман", "пара"], ["romantic vacation beach", "couple resort"]),
+        (["билет", "самолет", "перелет"], ["airport travel", "airplane window travel"]),
+        (["экскур", "достопримеч"], ["city tour travel", "tourist sightseeing"]),
+    ]
 
-    last_links = sum(1 for p in recent_posts[:2] if p["monetization_service"])
-    if last_links >= 1:
-        return False
+    for keys, queries in mappings:
+        if any(k in topic_lower for k in keys):
+            base.extend(queries)
 
-    return template in FORCE_LINK_TYPES or random.random() < 0.4
+    seen = []
+    for q in base:
+        q = q.strip()
+        if q and q not in seen:
+            seen.append(q)
+    return seen[:6]
 
 
-# ====== СПЕЦПОСТЫ ======
+async def fetch_pexels_photo(topic: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    if not PEXELS_API_KEY:
+        return None, None, None
 
-def check_special_post(now_dt, post_index):
+    queries = build_pexels_queries(topic)
+    orientation = get_setting("pexels_orientation", "landscape")
+    size = get_setting("pexels_size", "large")
+    per_page = int(get_setting("pexels_per_page", "10") or "10")
+
+    headers = {"Authorization": PEXELS_API_KEY}
+
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as http:
+        for query in queries:
+            try:
+                response = await http.get(
+                    "https://api.pexels.com/v1/search",
+                    headers=headers,
+                    params={
+                        "query": query,
+                        "per_page": per_page,
+                        "orientation": orientation,
+                        "size": size,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+                photos = data.get("photos", [])
+                if not photos:
+                    continue
+
+                picked = random.choice(photos[: min(len(photos), 5)])
+                src = picked.get("src", {})
+                image_url = (
+                    src.get("large2x")
+                    or src.get("large")
+                    or src.get("medium")
+                    or src.get("original")
+                )
+                if not image_url:
+                    continue
+
+                photographer = picked.get("photographer") or "Unknown photographer"
+                photo_page = picked.get("url") or "https://www.pexels.com/"
+
+                filename = f"{slugify(topic)}_{picked.get('id', random.randint(1000, 9999))}.jpg"
+                filepath = CACHE_DIR / filename
+
+                if not filepath.exists():
+                    image_resp = await http.get(image_url)
+                    image_resp.raise_for_status()
+                    filepath.write_bytes(image_resp.content)
+
+                credit = f"Фото: {photographer} / Pexels"
+                return str(filepath), credit, photo_page
+            except Exception:
+                logger.exception("Ошибка загрузки фото из Pexels | query=%s", query)
+
+    return None, None, None
+
+
+def build_template_instruction(template: str) -> str:
+    mapping = {
+        "useful": "Сделай полезный практический пост с конкретной пользой и без воды.",
+        "mistake": "Сделай пост в формате ошибка / антиошибка: что люди делают не так и как исправить.",
+        "selection": "Сделай пост в формате подборки / рейтинга / сравнения вариантов.",
+        "engagement": "Сделай вовлекающий вопрос, который вызывает комментарии и обсуждение.",
+        "provocation": "Сделай провокационный, но не токсичный пост со спорным тезисом.",
+        "trust": "Сделай доверительный пост как личное наблюдение автора.",
+        "expert": "Сделай экспертный разбор с неочевидимым нюансом.",
+        "seasonal": "Сделай сезонный / ситуативный пост, привязанный к моменту.",
+        "case": "Сделай мини-кейс или короткую историю ситуации.",
+        "selling": "Сделай мягко продающий пост без прямой рекламы, через проблему и решение.",
+        "mini_poll": "Сделай мини-анкету или быстрый опрос.",
+        "short": "Сделай короткий ситуативный пост в 2–4 абзаца.",
+        "special_low_price_map": "Сделай пост на тему карты низких цен на авиабилеты. Это должен быть полезный, понятный и живой пост.",
+        "special_hot_tours": "Сделай пост на тему горящих туров. Это должен быть живой и удобный для Telegram пост.",
+        "special_hotels_discount": "Сделай пост на тему отелей со скидкой до 80%.",
+    }
+    return mapping.get(template, "Сделай живой travel-пост.")
+
+
+def template_forbidden_rules(template: str) -> str:
+    if template in NO_LINK_TEMPLATES:
+        return "Не намекай на сервисы и не пиши про ботов или ссылки."
+    return "Не упоминай бренды сервисов и не вставляй ссылки сам."
+
+
+def template_structure_hint(template: str) -> str:
+    if template in {"short", "mini_poll", "engagement", "provocation"}:
+        return "Структура: короткий заголовок, 2–3 коротких абзаца, короткий вывод."
+    if template in {"selection", "expert", "selling"}:
+        return "Структура: заголовок, заход, 3 смысловых блока, вывод."
+    return "Структура: заголовок, заход, 2–3 смысловых блока, вывод."
+
+
+async def generate_post_via_openai(topic: str, template: str) -> str:
+    length_min, length_max = get_length_range(template)
+
+    prompt = f"""
+Ты пишешь Telegram-пост для travel-канала «Мир на ладони».
+
+Тема: {topic}
+Шаблон: {template}
+
+Требования:
+- язык: русский
+- стиль: живой, человеческий, читаемый с телефона
+- без канцелярита, штампов, AI-воды
+- 1–2 эмодзи, максимум 3
+- длина текста: {length_min}-{length_max} символов
+- {template_structure_hint(template)}
+- текст должен быть законченным
+- не используй markdown со звёздочками
+- делай абзацы короткими
+- не делай одинаковый шаблонный тон
+- {template_forbidden_rules(template)}
+
+Инструкция:
+{build_template_instruction(template)}
+
+Верни только готовый текст поста.
+""".strip()
+
+    response = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=1.0,
+        max_tokens=900,
+        messages=[
+            {"role": "system", "content": "Ты сильный редактор Telegram-канала про путешествия и рост охватов."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+
+    text = (response.choices[0].message.content or "").strip()
+    if not text:
+        raise ValueError("OpenAI вернул пустой текст")
+
+    return cleanup_post_text(text)
+
+
+async def generate_post_with_retry(topic: str, template: str, retries: int = 3, delay: int = 4) -> str:
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            text = await generate_post_via_openai(topic, template)
+            if looks_incomplete(text):
+                raise ValueError("Сгенерированный текст выглядит незавершённым")
+            return text
+        except Exception as exc:
+            last_error = exc
+            logger.exception(
+                "Ошибка генерации поста | topic=%s | template=%s | attempt=%s/%s",
+                topic,
+                template,
+                attempt,
+                retries,
+            )
+            if attempt < retries:
+                await asyncio.sleep(delay)
+    raise last_error
+
+
+def convert_plain_text_to_html(post_text: str) -> str:
+    text = (post_text or "").strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not parts:
+        return ""
+
+    html_blocks = []
+    title = escape_html_text(parts[0])
+    html_blocks.append(f"<b>{title}</b>")
+
+    subheading_pattern = re.compile(
+        r"^(Ошибка\s*\d+|Совет\s*\d+|Шаг\s*\d+|Пункт\s*\d+|Момент\s*\d+|Что важно|На что смотреть|Что проверить|Почему это важно)\s*[:.-]?\s*(.*)$",
+        re.IGNORECASE,
+    )
+
+    for block in parts[1:]:
+        escaped = escape_html_text(block)
+        lines = [line.strip() for line in escaped.split("\n") if line.strip()]
+
+        if len(lines) == 1:
+            m = subheading_pattern.match(html.unescape(lines[0]))
+            if m:
+                head = escape_html_text(m.group(1))
+                tail = escape_html_text(m.group(2))
+                html_blocks.append(f"<b>{head}</b>\n{tail}".strip())
+            else:
+                html_blocks.append(lines[0])
+            continue
+
+        first_line = lines[0]
+        m = subheading_pattern.match(html.unescape(first_line))
+        if m:
+            head = escape_html_text(m.group(1))
+            tail = escape_html_text(m.group(2))
+            rest = "\n".join(lines[1:])
+            block_html = f"<b>{head}</b>"
+            if tail:
+                block_html += f"\n{tail}"
+            if rest:
+                block_html += f"\n{rest}"
+            html_blocks.append(block_html.strip())
+        else:
+            html_blocks.append("\n".join(lines))
+
+    return "\n\n".join(html_blocks).strip()
+
+
+def format_post_card(row) -> str:
+    if not row:
+        return "Постов пока нет."
+
+    return (
+        f"Версия: {APP_VERSION}\n"
+        f"ID: {row['id']}\n"
+        f"Тема: {row['topic'] or '-'}\n"
+        f"Источник темы: {row['theme_source'] or '-'}\n"
+        f"Тип: {row['post_type'] or '-'}\n"
+        f"Цель: {row['goal'] or '-'}\n"
+        f"Статус: {row['status']}\n"
+        f"Сервис: {row['monetization_service'] or '-'}\n"
+        f"Реф-ссылка: {row['referral_url'] or '-'}\n"
+        f"Фото: {'да' if row['photo_path'] else 'нет'}\n\n"
+        f"{row['content']}"
+    )
+
+
+def build_link_blocks(services: List[Dict[str, Any]], template: str) -> List[str]:
+    blocks: List[str] = []
+    for service in services[:2]:
+        blocks.append(build_native_link_paragraph(service, template))
+    return blocks
+
+
+def format_post_text(
+    content: str,
+    template: str,
+    services: List[Dict[str, Any]],
+    recent_posts,
+    photo_credit: Optional[str],
+    photo_source_url: Optional[str],
+) -> str:
+    base_html = convert_plain_text_to_html(content)
+    blocks = []
+
+    link_blocks = build_link_blocks(services, template)
+    blocks.extend(link_blocks)
+
+    cta_text = build_cta(template, recent_posts)
+    if cta_text:
+        blocks.append(escape_html_text(cta_text))
+
+    credit_block = ""
+    if get_setting("photo_attribution_mode", "0") == "1" and photo_credit:
+        credit_text = escape_html_text(photo_credit)
+        credit_block = f"\n\n{credit_text}"
+        if photo_source_url:
+            credit_block += f'\n<a href="{photo_source_url}">Источник фото</a>'
+
+    ending_html = "\n\n".join(blocks).strip()
+
+    plain_base = re.sub(r"<[^>]+>", "", base_html)
+    plain_ending = re.sub(r"<[^>]+>", "", ending_html)
+    plain_credit = re.sub(r"<[^>]+>", "", credit_block)
+
+    max_base_len = 1024 - len(plain_ending) - len(plain_credit) - 4
+    trimmed_plain_base = trim_to_limit(plain_base, max(180, max_base_len))
+    base_html = convert_plain_text_to_html(trimmed_plain_base)
+
+    final_html = f"{base_html}\n\n{ending_html}{credit_block}".strip() if ending_html else f"{base_html}{credit_block}".strip()
+
+    final_plain = re.sub(r"<[^>]+>", "", final_html)
+    if len(final_plain) > 1024:
+        overflow = len(final_plain) - 1024
+        trimmed_plain_base = trim_to_limit(trimmed_plain_base, max(160, len(trimmed_plain_base) - overflow - 10))
+        base_html = convert_plain_text_to_html(trimmed_plain_base)
+        final_html = f"{base_html}\n\n{ending_html}{credit_block}".strip() if ending_html else f"{base_html}{credit_block}".strip()
+
+    return final_html
+
+
+def save_post(
+    topic: str,
+    theme_source: str,
+    goal: str,
+    post_type: str,
+    content: str,
+    referral_url: str,
+    monetization_service: str,
+    photo_path: Optional[str],
+    photo_credit: Optional[str],
+    photo_source_url: Optional[str],
+    status: str = "draft",
+) -> int:
+    with closing(db()) as conn:
+        cur = conn.execute("""
+            INSERT INTO posts(
+                topic, theme_source, goal, post_type, content,
+                referral_url, monetization_service,
+                photo_path, photo_credit, photo_source_url,
+                status, created_at, published_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            topic,
+            theme_source,
+            goal,
+            post_type,
+            content,
+            referral_url,
+            monetization_service,
+            photo_path,
+            photo_credit,
+            photo_source_url,
+            status,
+            now_iso(),
+            None,
+        ))
+        conn.commit()
+        return cur.lastrowid
+
+
+def update_post_status(post_id: int, status: str):
+    with closing(db()) as conn:
+        published_at = now_iso() if status in {"published", "tested"} else None
+        conn.execute(
+            "UPDATE posts SET status=?, published_at=COALESCE(?, published_at) WHERE id=?",
+            (status, published_at, post_id),
+        )
+        conn.commit()
+
+
+def build_special_post(now_dt: datetime, slot_index: int, total_slots: int) -> Optional[Dict[str, str]]:
     weekday = now_dt.weekday()
 
-    # вторник
-    if weekday == 1 and post_index == 2:
+    # Вторник, 2-й пост дня
+    if weekday == 1 and slot_index == 2:
         return {
-            "type": "special_aviasales",
-            "url": "https://aviasales.tp.st/05TrktsG?erid=2VtzqwmJxgb"
+            "template": "special_low_price_map",
+            "topic": "Карта низких цен на авиабилеты",
+            "url": "https://aviasales.tp.st/05TrktsG?erid=2VtzqwmJxgb",
+            "service_key": "special_low_price_map",
         }
 
-    # четверг
-    if weekday == 3 and post_index == 3:
+    # Четверг, последний пост дня
+    if weekday == 3 and slot_index == total_slots:
         return {
-            "type": "special_tours",
-            "url": "https://travelata.tp.st/42HvBmFJ?erid=2VtzqwyVPEu"
+            "template": "special_hot_tours",
+            "topic": "Горящие туры",
+            "url": "https://travelata.tp.st/42HvBmFJ?erid=2VtzqwyVPEu",
+            "service_key": "special_hot_tours",
         }
 
-    # пятница
-    if weekday == 4 and post_index == 2:
+    # Пятница, 2-й пост дня
+    if weekday == 4 and slot_index == 2:
         return {
-            "type": "special_hotels",
-            "url": "https://www.trip.com/t/OdWcYTrlHU2"
+            "template": "special_hotels_discount",
+            "topic": "Отели со скидкой до 80%",
+            "url": "https://www.trip.com/t/OdWcYTrlHU2",
+            "service_key": "special_hotels_discount",
         }
 
     return None
 
 
-# ====== PROMPT ======
+def make_special_service(special: Dict[str, str]) -> Dict[str, Any]:
+    if special["template"] == "special_low_price_map":
+        return {
+            "key": special["service_key"],
+            "name": "Low Price Map",
+            "category": "flights",
+            "url": special["url"],
+            "anchor_options": ["карту низких цен", "низкие цены на авиабилеты", "дешёвые варианты перелёта"],
+        }
+    if special["template"] == "special_hot_tours":
+        return {
+            "key": special["service_key"],
+            "name": "Hot Tours",
+            "category": "tours",
+            "url": special["url"],
+            "anchor_options": ["горящие туры", "варианты горящих туров", "туры по акции"],
+        }
+    return {
+        "key": special["service_key"],
+        "name": "Hotel Discounts",
+        "category": "hotels",
+        "url": special["url"],
+        "anchor_options": ["отели со скидкой", "варианты отелей со скидкой", "отели по акции"],
+    }
 
-async def generate_post_via_openai(topic, template):
 
-    length_min, length_max = get_length_range(template)
+async def create_post_record(
+    topic: str,
+    source_type: str,
+    goal: str,
+    forced_post_type: Optional[str] = None,
+    forced_services: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    recent_posts = get_recent_posts(7)
+    template = forced_post_type or choose_post_template()
 
-    prompt = f"""
-Ты пишешь пост для Telegram travel-канала.
+    content = await generate_post_with_retry(topic, template)
+    services = forced_services if forced_services is not None else choose_services(topic, content, template, recent_posts)
 
-Тип: {template}
-Тема: {topic}
+    referral_url = ",".join([s["url"] for s in services[:2]]) if services else ""
+    monetization_service = services[0]["key"] if services else ""
 
-Требования:
-- живой стиль
-- не сухо
-- 1–2 эмодзи
-- длина {length_min}-{length_max}
-- без ссылок
-- без рекламы
-- структура:
-  заголовок
-  короткий заход
-  2-3 блока
-  вывод
-
-Сделай текст НЕ шаблонным.
-"""
-
-    response = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=1.0,
+    logger.info(
+        "POST_DECISION | version=%s | topic=%s | template=%s | service=%s | urls=%s",
+        APP_VERSION,
+        topic,
+        template,
+        monetization_service or "none",
+        referral_url or "none",
     )
 
-    return cleanup_post_text(response.choices[0].message.content)
+    photo_path, photo_credit, photo_source_url = await fetch_pexels_photo(topic)
+
+    post_id = save_post(
+        topic=topic,
+        theme_source=source_type,
+        goal=goal,
+        post_type=template,
+        content=content,
+        referral_url=referral_url,
+        monetization_service=monetization_service,
+        photo_path=photo_path,
+        photo_credit=photo_credit,
+        photo_source_url=photo_source_url,
+        status="draft",
+    )
+
+    increment_post_type_stat(template)
+    return post_id
 
 
-# ====== СБОРКА ФИНАЛА ======
+async def publish_post_record(bot, channel_id: str, row, mark_status: str = "published"):
+    recent_posts = get_recent_posts(7)
 
-def format_post_text(content, template, service, recent_posts):
+    services: List[Dict[str, Any]] = []
+    if row["referral_url"]:
+        urls = [u.strip() for u in (row["referral_url"] or "").split(",") if u.strip()]
+        if (row["monetization_service"] or "").startswith("special_"):
+            special = {
+                "template": row["post_type"],
+                "url": urls[0] if urls else "",
+                "service_key": row["monetization_service"],
+            }
+            services = [make_special_service(special)] if urls else []
+        else:
+            for url in urls[:2]:
+                matched = next((s for s in SERVICES if s["url"] == url), None)
+                if matched:
+                    services.append(matched)
 
-    base = convert_plain_text_to_html(content)
+    text = format_post_text(
+        content=row["content"],
+        template=row["post_type"] or "useful",
+        services=services,
+        recent_posts=recent_posts,
+        photo_credit=row["photo_credit"],
+        photo_source_url=row["photo_source_url"],
+    )
 
-    blocks = []
+    photo_path = row["photo_path"]
+    if photo_path and Path(photo_path).exists():
+        with open(photo_path, "rb") as photo_file:
+            await bot.send_photo(
+                chat_id=channel_id,
+                photo=photo_file,
+                caption=text,
+                parse_mode="HTML",
+            )
+    else:
+        await bot.send_message(
+            chat_id=channel_id,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=False,
+        )
 
-    if service:
-        blocks.append(build_native_link_paragraph(service, template))
+    update_post_status(row["id"], mark_status)
 
-    cta = build_cta(choose_cta(template))
-    if cta:
-        blocks.append(cta)
 
-    return base + "\n\n" + "\n\n".join(blocks)
+async def scheduled_autopost_job(app: Application):
+    if get_setting("autopost_enabled", "1") != "1":
+        logger.info("Автопостинг отключён, задача пропущена")
+        return
+
+    schedule_raw = get_setting("post_times", DEFAULT_POST_TIMES or "09:00,14:00,19:00")
+    now_dt = datetime.now(BOT_TZ)
+    times = parse_schedule(schedule_raw)
+    slot_index = get_today_post_slot(now_dt, schedule_raw)
+    total_slots = len(times)
+
+    special = build_special_post(now_dt, slot_index, total_slots)
+    if special:
+        post_id = await create_post_record(
+            topic=special["topic"],
+            source_type="special_schedule",
+            goal="autopost",
+            forced_post_type=special["template"],
+            forced_services=[make_special_service(special)],
+        )
+        row = get_post(post_id)
+        await publish_post_record(app.bot, TELEGRAM_CHANNEL_ID, row, mark_status="published")
+        logger.info(
+            "Спецпост опубликован | version=%s | template=%s | topic=%s",
+            APP_VERSION,
+            special["template"],
+            special["topic"],
+        )
+        return
+
+    topic, source_type = get_next_topic()
+    post_id = await create_post_record(
+        topic=topic,
+        source_type=source_type,
+        goal="autopost",
+        forced_post_type=None,
+    )
+    row = get_post(post_id)
+    await publish_post_record(app.bot, TELEGRAM_CHANNEL_ID, row, mark_status="published")
+    logger.info(
+        "Автопост опубликован | version=%s | id=%s | topic=%s | type=%s | service=%s",
+        APP_VERSION,
+        post_id,
+        topic,
+        row["post_type"],
+        row["monetization_service"],
+    )
+
+
+def rebuild_scheduler(app: Application):
+    global scheduler_instance
+
+    schedule_raw = get_setting("post_times", DEFAULT_POST_TIMES or "09:00,14:00,19:00")
+    autopost_enabled = get_setting("autopost_enabled", "1") == "1"
+
+    if scheduler_instance is None:
+        scheduler_instance = AsyncIOScheduler(timezone=BOT_TZ)
+
+    if scheduler_instance.running:
+        scheduler_instance.remove_all_jobs()
+
+    if autopost_enabled:
+        for hour, minute in parse_schedule(schedule_raw):
+            scheduler_instance.add_job(
+                scheduled_autopost_job,
+                trigger="cron",
+                hour=hour,
+                minute=minute,
+                args=[app],
+                id=f"autopost_{hour:02d}_{minute:02d}",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+
+    if not scheduler_instance.running:
+        scheduler_instance.start()
+
+    logger.info("Scheduler rebuilt | version=%s | enabled=%s | times=%s", APP_VERSION, autopost_enabled, schedule_raw)
+
+
+@admin_only
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_reply(
+        update,
+        f"Бот работает.\nВерсия: {APP_VERSION}\n\n"
+        "/gen [тема] — сгенерировать пост\n"
+        "/publish [id] — опубликовать пост\n"
+        "/last — последний пост\n"
+        "/version — показать активную версию\n"
+        "/schedule — показать расписание\n"
+        "/set_schedule 09:00,14:00,19:00 — поменять расписание\n"
+        "/autopost_on — включить автопостинг\n"
+        "/autopost_off — выключить автопостинг\n"
+        "/test_channel — тестовый пост в тестовый канал\n"
+        "/test_post [id] — тест конкретного поста\n"
+        "/topic_add текст — добавить тему\n"
+        "/topics — показать темы\n"
+        "/set_test_channel @my_test_channel — обновить тестовый канал"
+    )
+
+
+@admin_only
+async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_reply(update, f"Активная версия: {APP_VERSION}")
+
+
+@admin_only
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_cmd(update, context)
+
+
+@admin_only
+async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    topic = " ".join(context.args).strip() if context.args else ""
+
+    if not topic:
+        topic, source_type = get_next_topic()
+    else:
+        source_type = "manual"
+
+    await safe_reply(update, f"Генерирую пост по теме: {topic}")
+
+    post_id = await create_post_record(
+        topic=topic,
+        source_type=source_type,
+        goal="manual",
+        forced_post_type=None,
+    )
+    row = get_post(post_id)
+
+    await safe_reply(
+        update,
+        f"Пост создан.\n\n{format_post_card(row)}\n\n"
+        f"Для публикации: /publish {post_id}\n"
+        f"Для теста: /test_post {post_id}"
+    )
+
+
+@admin_only
+async def publish_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await safe_reply(update, "Пример: /publish 12")
+        return
+
+    try:
+        post_id = int(context.args[0])
+    except ValueError:
+        await safe_reply(update, "ID должен быть числом. Пример: /publish 12")
+        return
+
+    row = get_post(post_id)
+    if not row:
+        await safe_reply(update, f"Пост с ID {post_id} не найден.")
+        return
+
+    await publish_post_record(context.bot, TELEGRAM_CHANNEL_ID, row, mark_status="published")
+    await safe_reply(update, f"Пост {post_id} опубликован.")
+
+
+@admin_only
+async def last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    row = get_last_post()
+    await safe_reply(update, format_post_card(row))
+
+
+@admin_only
+async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    enabled = "включен" if get_setting("autopost_enabled", "1") == "1" else "выключен"
+    schedule_raw = get_setting("post_times", DEFAULT_POST_TIMES or "09:00,14:00,19:00")
+    stats = get_content_stats()
+    stats_text = ", ".join([f"{k}: {v}" for k, v in stats.items()])
+    await safe_reply(
+        update,
+        f"Версия: {APP_VERSION}\n"
+        f"Автопостинг: {enabled}\n"
+        f"Время публикаций (UTC+3): {schedule_raw}\n"
+        f"Статистика типов: {stats_text}"
+    )
+
+
+@admin_only
+async def set_schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = " ".join(context.args).strip()
+    if not raw:
+        await safe_reply(update, "Пример: /set_schedule 08:30,13:00,18:45")
+        return
+
+    try:
+        parse_schedule(raw)
+    except Exception as exc:
+        await safe_reply(update, f"Ошибка расписания: {exc}")
+        return
+
+    set_setting("post_times", raw)
+    rebuild_scheduler(context.application)
+    await safe_reply(update, f"Расписание обновлено (UTC+3): {raw}")
+
+
+@admin_only
+async def autopost_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_setting("autopost_enabled", "1")
+    rebuild_scheduler(context.application)
+    await safe_reply(update, "Автопостинг включен.")
+
+
+@admin_only
+async def autopost_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_setting("autopost_enabled", "0")
+    rebuild_scheduler(context.application)
+    await safe_reply(update, "Автопостинг выключен.")
+
+
+@admin_only
+async def test_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    test_channel_id = get_setting("test_channel_id", TEST_CHANNEL_ID).strip()
+    if not test_channel_id:
+        await safe_reply(update, "Не задан TEST_CHANNEL_ID или test_channel_id в настройках.")
+        return
+
+    row = get_last_post()
+    if not row:
+        post_id = await create_post_record(
+            topic="Тестовый пост для проверки канала",
+            source_type="test",
+            goal="test",
+            forced_post_type="short",
+        )
+        row = get_post(post_id)
+
+    try:
+        await publish_post_record(context.bot, test_channel_id, row, mark_status="tested")
+        await safe_reply(update, f"Тестовая публикация отправлена в {test_channel_id}.")
+    except Forbidden:
+        await safe_reply(
+            update,
+            "Не удалось отправить в тестовый канал: бот не состоит в канале или у него нет прав публикации."
+        )
+
+
+@admin_only
+async def test_post_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await safe_reply(update, "Пример: /test_post 12")
+        return
+
+    try:
+        post_id = int(context.args[0])
+    except ValueError:
+        await safe_reply(update, "ID должен быть числом. Пример: /test_post 12")
+        return
+
+    row = get_post(post_id)
+    if not row:
+        await safe_reply(update, f"Пост с ID {post_id} не найден.")
+        return
+
+    test_channel_id = get_setting("test_channel_id", TEST_CHANNEL_ID).strip()
+    if not test_channel_id:
+        await safe_reply(update, "Не задан тестовый канал.")
+        return
+
+    try:
+        await publish_post_record(context.bot, test_channel_id, row, mark_status="tested")
+        await safe_reply(update, f"Пост {post_id} отправлен в тестовый канал.")
+    except Forbidden:
+        await safe_reply(update, "Бот не может публиковать в тестовый канал. Проверьте членство и права.")
+
+
+@admin_only
+async def topics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT id, topic_text, source_type, used FROM topics ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+
+    if not rows:
+        await safe_reply(update, "Тем пока нет.")
+        return
+
+    text = "Последние темы:\n\n"
+    for row in rows:
+        text += (
+            f"{row['id']}. {row['topic_text']} | "
+            f"источник={row['source_type']} | used={row['used']}\n"
+        )
+    text += "\nДобавить: /topic_add Ваша тема"
+    await safe_reply(update, text)
+
+
+@admin_only
+async def topic_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    topic = " ".join(context.args).strip()
+    if not topic:
+        await safe_reply(update, "Пример: /topic_add Как выбрать тур в Турцию летом")
+        return
+
+    with closing(db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO topics(topic_text, source_type, source_name, used, created_at)
+            VALUES (?, 'manual', 'admin', 0, ?)
+            """,
+            (topic, now_iso()),
+        )
+        conn.commit()
+
+    await safe_reply(update, f"Тема добавлена: {topic}")
+
+
+@admin_only
+async def set_test_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await safe_reply(update, "Пример: /set_test_channel @my_test_channel")
+        return
+
+    channel = context.args[0].strip()
+    set_setting("test_channel_id", channel)
+    await safe_reply(update, f"Тестовый канал обновлён: {channel}")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception", exc_info=context.error)
+
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"Произошла ошибка. Версия: {APP_VERSION}",
+                reply_markup=main_menu_keyboard(),
+            )
+        except Exception:
+            logger.exception("Не удалось отправить сообщение об ошибке пользователю")
+
+
+async def post_init(application: Application) -> None:
+    rebuild_scheduler(application)
+    logger.info("Bot starting | version=%s", APP_VERSION)
+
+
+def build_application() -> Application:
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("menu", menu_cmd))
+    app.add_handler(CommandHandler("version", version_cmd))
+    app.add_handler(CommandHandler("gen", gen_cmd))
+    app.add_handler(CommandHandler("publish", publish_cmd))
+    app.add_handler(CommandHandler("last", last_cmd))
+    app.add_handler(CommandHandler("schedule", schedule_cmd))
+    app.add_handler(CommandHandler("set_schedule", set_schedule_cmd))
+    app.add_handler(CommandHandler("autopost_on", autopost_on_cmd))
+    app.add_handler(CommandHandler("autopost_off", autopost_off_cmd))
+    app.add_handler(CommandHandler("test_channel", test_channel_cmd))
+    app.add_handler(CommandHandler("test_post", test_post_cmd))
+    app.add_handler(CommandHandler("topics", topics_cmd))
+    app.add_handler(CommandHandler("topic_add", topic_add_cmd))
+    app.add_handler(CommandHandler("set_test_channel", set_test_channel_cmd))
+
+    app.add_error_handler(error_handler)
+    return app
+
+
+def main():
+    init_db()
+    app = build_application()
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
