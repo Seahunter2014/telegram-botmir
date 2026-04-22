@@ -20,8 +20,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
 
-APP_VERSION = "travel-matrix-v7-live-channel"
-CONTENT_MATRIX_VERSION = "travel-matrix-v7-live-channel"
+APP_VERSION = "travel-matrix-v8-self-balance"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
@@ -57,22 +56,20 @@ logger = logging.getLogger("mirnaladoni_bot")
 
 scheduler_instance: Optional[AsyncIOScheduler] = None
 
-# Базовые шаблоны + новости/события.
-# Перебалансировано, чтобы бот не залипал на "полезных советах".
+# 12 базовых шаблонов + 3 специальных сценария по расписанию
 POST_TEMPLATES: Dict[str, int] = {
-    "useful": 11,
-    "mistake": 11,
-    "selection": 9,
-    "engagement": 9,
+    "useful": 12,
+    "mistake": 12,
+    "selection": 10,
+    "engagement": 10,
     "provocation": 5,
-    "trust": 7,
-    "expert": 9,
+    "trust": 8,
+    "expert": 10,
     "seasonal": 8,
     "case": 7,
-    "selling": 10,
+    "selling": 12,
     "mini_poll": 3,
     "short": 3,
-    "news_events": 8,
 }
 
 SPECIAL_TEMPLATES = {
@@ -91,7 +88,6 @@ TEMPLATE_LENGTH_CLASS = {
     "trust": "medium",
     "seasonal": "medium",
     "case": "medium",
-    "news_events": "medium",
     "selection": "long",
     "expert": "long",
     "selling": "long",
@@ -119,45 +115,14 @@ STYLE_VARIANTS = {
     "selling": ["продающий мягкий пост", "решение проблемы"],
     "mini_poll": ["мини-анкета", "быстрый опрос"],
     "short": ["короткий ситуативный пост", "короткое наблюдение"],
-    "news_events": ["travel-новость", "событие/инфоповод", "живой обзор события"],
     "special_low_price_map": ["спецпост про карту низких цен"],
     "special_hot_tours": ["спецпост про горящие туры"],
     "special_hotels_discount": ["спецпост про отели со скидкой"],
 }
 
 NO_LINK_TEMPLATES = {"engagement", "provocation", "trust", "mini_poll"}
-OPTIONAL_LINK_TEMPLATES = {
-    "useful",
-    "selection",
-    "expert",
-    "mistake",
-    "seasonal",
-    "case",
-    "short",
-    "news_events",
-}
-FORCED_LINK_TEMPLATES = {
-    "selling",
-    "special_low_price_map",
-    "special_hot_tours",
-    "special_hotels_discount",
-}
-
-STRONG_SERVICE_GROUPS = {
-    "hotels",
-    "flights",
-    "tours",
-    "insurance",
-    "transfer",
-    "car_rental",
-    "bike_rental",
-    "excursions",
-    "events",
-    "ground_transport",
-    "rail_europe",
-    "airport",
-    "cruises",
-}
+OPTIONAL_LINK_TEMPLATES = {"useful", "selection", "expert", "mistake", "seasonal", "case", "short"}
+FORCED_LINK_TEMPLATES = {"selling", "special_low_price_map", "special_hot_tours", "special_hotels_discount"}
 
 SERVICES: List[Dict[str, Any]] = [
     {
@@ -175,7 +140,7 @@ SERVICES: List[Dict[str, Any]] = [
         "name": "Yandex Travel",
         "category": "general_travel",
         "url": "https://yandex.tp.st/y94GSOah",
-        "keywords": ["путешествие", "поездка", "отдых", "маршрут"],
+        "keywords": ["путешествие", "поездка", "отдых", "маршрут", "направление"],
         "anchor_options": ["варианты поездки", "варианты отдыха", "удобные варианты"],
         "priority": 3,
         "is_active": True,
@@ -195,7 +160,7 @@ SERVICES: List[Dict[str, Any]] = [
         "name": "VIP Zal",
         "category": "airport",
         "url": "https://vip-zal.tp.st/VUTiM7FJ",
-        "keywords": ["лаунж", "бизнес-зал", "бизнес зал", "зал ожидания", "аэропорт", "долгая пересадка"],
+        "keywords": ["лаунж", "бизнес-зал", "бизнес зал", "зал ожидания", "аэропорт", "долгая пересадка", "пересадка"],
         "anchor_options": ["доступ в лаунж", "варианты бизнес-залов", "лаунж-залы в аэропорту"],
         "priority": 6,
         "is_active": True,
@@ -295,7 +260,7 @@ SERVICES: List[Dict[str, Any]] = [
         "name": "TicketNetwork",
         "category": "events",
         "url": "https://ticketnetwork.tp.st/evSOqzXe",
-        "keywords": ["концерт", "шоу", "мероприятие", "событие", "матч", "спектакль"],
+        "keywords": ["концерт", "шоу", "мероприятие", "событие", "матч", "спектакль", "выставка", "фестиваль"],
         "anchor_options": ["билеты на мероприятия", "события по направлению", "интересные мероприятия"],
         "priority": 7,
         "is_active": True,
@@ -337,7 +302,7 @@ TOPIC_GROUP_RULES = {
     "rail_europe": ["европа", "поезд по европе", "поезда европы"],
     "airport": ["лаунж", "бизнес-зал", "зал ожидания", "пересадка", "аэропорт"],
     "general_bot": ["куда поехать", "что выбрать", "подобрать поездку", "подобрать отдых"],
-    "general_travel": ["маршрут", "поездка", "отдых", "путешествие", "направление"],
+    "general_travel": ["поездка", "отдых", "маршрут", "направление", "путешествие"],
 }
 
 CTA_CLASSES = {
@@ -462,7 +427,6 @@ def init_db():
     ensure_default_settings()
     ensure_default_topics()
     ensure_default_content_stats()
-    ensure_content_matrix_version()
 
 
 def ensure_default_content_stats():
@@ -477,25 +441,6 @@ def ensure_default_content_stats():
                 (post_type,),
             )
         conn.commit()
-
-
-def reset_content_stats():
-    with closing(db()) as conn:
-        conn.execute("DELETE FROM content_stats")
-        conn.commit()
-    ensure_default_content_stats()
-
-
-def ensure_content_matrix_version():
-    saved = get_setting("content_matrix_version", "")
-    if saved != CONTENT_MATRIX_VERSION:
-        reset_content_stats()
-        set_setting("content_matrix_version", CONTENT_MATRIX_VERSION)
-        logger.info(
-            "Content matrix version reset | old=%s | new=%s",
-            saved or "none",
-            CONTENT_MATRIX_VERSION,
-        )
 
 
 def increment_post_type_stat(post_type: str):
@@ -514,11 +459,27 @@ def increment_post_type_stat(post_type: str):
 
 
 def get_content_stats() -> Dict[str, int]:
+    """
+    Для отображения и самобалансировки используем не "вечную" статистику,
+    а скользящее окно последних обычных постов.
+    Это убирает необходимость ручных сбросов.
+    """
+    stats = {post_type: 0 for post_type in POST_TEMPLATES.keys()}
     with closing(db()) as conn:
-        rows = conn.execute("SELECT post_type, count FROM content_stats").fetchall()
-    stats = {row["post_type"]: row["count"] for row in rows}
-    for post_type in POST_TEMPLATES.keys():
-        stats.setdefault(post_type, 0)
+        rows = conn.execute(
+            """
+            SELECT post_type
+            FROM posts
+            WHERE post_type NOT IN ('special_low_price_map', 'special_hot_tours', 'special_hotels_discount')
+            ORDER BY id DESC
+            LIMIT 60
+            """
+        ).fetchall()
+
+    for row in rows:
+        post_type = row["post_type"]
+        if post_type in stats:
+            stats[post_type] += 1
     return stats
 
 
@@ -557,7 +518,6 @@ def ensure_default_settings():
 
 def ensure_default_topics():
     default_topics = [
-        # Практика
         "5 ошибок при бронировании отпуска",
         "Как выбрать идеальный отель без разочарований",
         "Когда лучше покупать билеты",
@@ -573,42 +533,27 @@ def ensure_default_topics():
         "Почему дешёвый тур иногда выходит дороже",
         "Как не ошибиться с отелем в первый раз",
         "Нужна ли страховка, если летишь всего на неделю",
-        # Вдохновение и направления
-        "5 причин однажды увидеть Каппадокию своими глазами",
-        "Почему весенний Стамбул нравится даже тем, кто не любит мегаполисы",
-        "Что особенно цепляет в Тбилиси с первого дня",
-        "Куда поехать в Европе, если хочется красивых улиц и спокойного ритма",
         "Почему маленькие приморские города иногда лучше раскрученных курортов",
-        "Где искать атмосферный отдых без толп туристов",
-        "Чем хороши короткие поездки на 3–4 дня",
-        # Истории и кейсы
-        "История поездки, которая сначала пошла не по плану, а потом стала лучшей",
-        "Кейс: как одна ошибка с багажом испортила маршрут",
-        "Кейс: как удачный выбор района спас весь отпуск",
-        "Мини-история о том, почему спешка перед вылетом обходится дорого",
-        # Вовлечение и опросы
-        "Что для вас важнее в поездке: комфорт, эмоции или экономия",
-        "Какой формат отдыха вам ближе: море, город или горы",
-        "Вы бы выбрали раннее бронирование или горящий тур",
-        "Есть ли у вас правило, без которого вы не собираетесь в поездку",
-        # Сезонка
-        "Куда особенно приятно ехать весной",
-        "Какие направления раскрываются именно осенью",
-        "Где летом лучше не экономить, а где можно спокойно сократить бюджет",
+        "Что особенно цепляет в Стамбуле весной",
+        "Куда уехать на 3–4 дня, если хочется сменить картинку",
+        "Как одна ошибка с районом проживания портит всю поездку",
+        "Какие форматы отдыха люди чаще всего недооценивают",
+        "Что важнее в отпуске: экономия, комфорт или впечатления",
         "Почему межсезонье часто выгоднее пикового периода",
-        # Новости/инфоповоды/события
-        "Какие travel-события и маршруты сейчас особенно обсуждают путешественники",
-        "На какие travel-новости стоит обратить внимание перед следующим отпуском",
-        "Почему новые маршруты и события меняют выбор направления",
-        "Как выставки, концерты и матчи могут стать поводом для поездки",
-        "Когда поездку стоит строить вокруг большого события, а не только вокруг пляжа",
-        "Как концерт, фестиваль или матч могут сделать путешествие ярче",
-        "Почему распродажи авиабилетов — это не только про экономию, но и про спонтанные идеи",
-        # Продающие мягкие
-        "Когда заранее смотреть варианты тура действительно выгоднее",
-        "Почему удобнее сравнить варианты проживания до бронирования",
-        "Когда аренда авто делает поездку заметно лучше",
+        "Когда аренда авто действительно делает поездку удобнее",
         "В каких случаях трансфер из аэропорта — это не роскошь, а спокойствие",
+        "Как выставка, матч или концерт могут стать поводом для поездки",
+        "Что выбрать: отель в центре или жильё подальше, но тише",
+        "Какие расходы в путешествии чаще всего недооценивают",
+        "Почему спонтанные поездки иногда получаются ярче запланированных",
+        "Как не прогадать с коротким городским путешествием",
+        "Что люди зря игнорируют при выборе пакетного тура",
+        "Почему красивое место ещё не всегда равно хорошему отдыху",
+        "Какие вопросы стоит задать себе до покупки билетов",
+        "Когда горы лучше моря, а когда наоборот",
+        "Как собрать поездку так, чтобы не уставать с первого дня",
+        "Какие признаки выдают неудачный вариант проживания ещё до бронирования",
+        "Почему путешествие ради события иногда запоминается сильнее, чем пляжный отдых",
     ]
 
     with closing(db()) as conn:
@@ -617,8 +562,8 @@ def ensure_default_topics():
 
         inserted = 0
         for topic in default_topics:
-            norm = topic.strip().lower()
-            if norm in existing_topics:
+            normalized = topic.strip().lower()
+            if normalized in existing_topics:
                 continue
             conn.execute(
                 """
@@ -764,10 +709,10 @@ def get_next_topic() -> Tuple[str, str]:
 
     fallback = random.choice([
         "5 ошибок при бронировании отпуска",
+        "Как выставка, матч или концерт могут стать поводом для поездки",
         "Почему маленькие приморские города иногда лучше раскрученных курортов",
-        "Как концерт, фестиваль или матч могут сделать путешествие ярче",
-        "Когда заранее смотреть варианты тура действительно выгоднее",
-        "Какие travel-события и маршруты сейчас особенно обсуждают путешественники",
+        "Что важнее в отпуске: экономия, комфорт или впечатления",
+        "Когда аренда авто действительно делает поездку удобнее",
     ])
     return fallback, "fallback"
 
@@ -802,10 +747,10 @@ def get_today_post_slot(now_dt: datetime, schedule_raw: str) -> int:
 
 
 def template_family(template: str) -> str:
-    family_map = {
-        "useful": "knowledge",
-        "mistake": "knowledge",
-        "expert": "knowledge",
+    families = {
+        "useful": "practical",
+        "mistake": "practical",
+        "expert": "practical",
         "selection": "comparison",
         "selling": "comparison",
         "engagement": "engagement",
@@ -813,17 +758,17 @@ def template_family(template: str) -> str:
         "provocation": "engagement",
         "trust": "human",
         "case": "human",
-        "seasonal": "timely",
-        "news_events": "timely",
-        "short": "short",
+        "seasonal": "situational",
+        "short": "situational",
     }
-    return family_map.get(template, template)
+    return families.get(template, template)
 
 
 def choose_post_template() -> str:
     stats = get_content_stats()
     total = sum(stats.values())
-    recent = get_recent_posts(5)
+
+    recent = get_recent_posts(8)
     recent_types = [row["post_type"] for row in recent if row["post_type"] and row["post_type"] in POST_TEMPLATES]
     recent_families = [template_family(t) for t in recent_types]
 
@@ -840,15 +785,13 @@ def choose_post_template() -> str:
 
     for template in list(deficits.keys()):
         if recent_types and recent_types[0] == template:
-            deficits[template] -= 25
-        if recent_types.count(template) >= 2:
-            deficits[template] -= 12
-        if recent_families and recent_families[0] == template_family(template):
-            deficits[template] -= 8
-        if recent_families.count(template_family(template)) >= 3:
-            deficits[template] -= 8
-        if template == "selling" and recent_types and recent_types[0] == "selling":
             deficits[template] -= 35
+        if recent_types.count(template) >= 2:
+            deficits[template] -= 18
+        if recent_families and recent_families[0] == template_family(template):
+            deficits[template] -= 10
+        if template == "selling" and recent_types and recent_types[0] == "selling":
+            deficits[template] -= 40
 
     best = max(deficits.values())
     candidates = [k for k, v in deficits.items() if v == best]
@@ -873,6 +816,7 @@ def topic_groups(topic: str, content: str = "") -> List[str]:
     content_text = normalize_text(content)
 
     scores: Dict[str, int] = {}
+
     for group, keywords in TOPIC_GROUP_RULES.items():
         score = 0
         for kw in keywords:
@@ -883,6 +827,19 @@ def topic_groups(topic: str, content: str = "") -> List[str]:
         if score > 0:
             scores[group] = score
 
+    # Дополнительное усиление через keywords самих сервисов
+    for service in SERVICES:
+        if not service["is_active"]:
+            continue
+        service_score = 0
+        for kw in service["keywords"]:
+            if kw in topic_text:
+                service_score += 2
+            if kw in content_text:
+                service_score += 1
+        if service_score > 0:
+            scores[service["category"]] = scores.get(service["category"], 0) + service_score
+
     if not scores:
         return []
 
@@ -891,8 +848,10 @@ def topic_groups(topic: str, content: str = "") -> List[str]:
     return winners
 
 
-def is_strong_service_topic(groups: List[str]) -> bool:
-    return bool(set(groups) & STRONG_SERVICE_GROUPS)
+def build_service_candidates(groups: List[str]) -> List[Dict[str, Any]]:
+    matches = [s for s in SERVICES if s["is_active"] and s["category"] in groups]
+    matches.sort(key=lambda x: x["priority"], reverse=True)
+    return matches
 
 
 def should_insert_links(template: str, recent_posts, groups: Optional[List[str]] = None) -> bool:
@@ -901,27 +860,23 @@ def should_insert_links(template: str, recent_posts, groups: Optional[List[str]]
     if template in NO_LINK_TEMPLATES:
         return False
 
-    # Не ставим ссылки подряд
+    # Нельзя два поста со ссылками подряд
     if recent_posts_have_links(recent_posts, lookback=1):
         return False
 
     if template in FORCED_LINK_TEMPLATES:
         return True
 
-    # Если тема явно сервисная, ссылка должна появляться чаще
-    if is_strong_service_topic(groups) and template in OPTIONAL_LINK_TEMPLATES:
-        return True
+    # Для сервисных полезных / экспертных / ошибок / сезонных — ссылка обязательна при явной теме
+    if template in {"useful", "expert", "mistake", "seasonal", "selection"} and groups:
+        strong = [g for g in groups if g not in {"general_bot", "general_travel"}]
+        if strong:
+            return True
 
     if template in OPTIONAL_LINK_TEMPLATES:
         return random.random() < 0.45
 
     return False
-
-
-def build_service_candidates(groups: List[str]) -> List[Dict[str, Any]]:
-    matches = [s for s in SERVICES if s["is_active"] and s["category"] in groups]
-    matches.sort(key=lambda x: x["priority"], reverse=True)
-    return matches
 
 
 def choose_services(topic: str, content: str, template: str, recent_posts) -> List[Dict[str, Any]]:
@@ -959,15 +914,12 @@ def choose_services(topic: str, content: str, template: str, recent_posts) -> Li
 
     chosen: List[Dict[str, Any]] = [candidates[0]]
 
-    if template in {"selection", "selling", "seasonal"} and len(candidates) > 1 and random.random() < 0.28:
+    # максимум 2 ссылки в посте, вторую добавляем редко и только там, где это уместно
+    if template in {"selection", "selling", "seasonal"} and len(candidates) > 1 and random.random() < 0.30:
         for candidate in candidates[1:]:
             if candidate["key"] != chosen[0]["key"]:
                 chosen.append(candidate)
                 break
-
-    # Для news_events используем только 1 ссылку, чтобы пост выглядел легче
-    if template == "news_events":
-        return chosen[:1]
 
     return chosen[:2]
 
@@ -976,7 +928,7 @@ def choose_cta_class(template: str, recent_posts) -> str:
     preferred = {
         "selling": ["soft_sell", "share", "subscribe"],
         "engagement": ["choice", "comment"],
-        "mini_poll": ["choice", "comment"],
+        "mini_poll": ["choice"],
         "provocation": ["comment", "choice"],
         "trust": ["none", "comment"],
         "expert": ["comment", "save", "none"],
@@ -986,7 +938,6 @@ def choose_cta_class(template: str, recent_posts) -> str:
         "seasonal": ["save", "soft_sell", "subscribe"],
         "case": ["comment", "share", "none"],
         "short": ["save", "none", "comment"],
-        "news_events": ["subscribe", "share", "comment", "none"],
         "special_low_price_map": ["soft_sell", "share"],
         "special_hot_tours": ["soft_sell", "share"],
         "special_hotels_discount": ["soft_sell", "share"],
@@ -997,8 +948,8 @@ def choose_cta_class(template: str, recent_posts) -> str:
 
     filtered_classes = []
     for cta_class in options:
-        class_phrases = CTA_CLASSES.get(cta_class, [])
-        if not any(phrase in recent_text for phrase in class_phrases):
+        phrases = CTA_CLASSES.get(cta_class, [])
+        if not any(phrase in recent_text for phrase in phrases):
             filtered_classes.append(cta_class)
 
     return random.choice(filtered_classes or options)
@@ -1054,24 +1005,24 @@ def build_native_link_paragraph(service: Dict[str, Any], template: str) -> str:
             f'В таких маршрутах стоит заранее открыть <a href="{url}">{anchor}</a>.',
         ],
         "events": [
-            f'Если хочется заранее понять, что посмотреть на месте, можно открыть <a href="{url}">{anchor}</a>.',
-            f'Такие поездки удобнее планировать, когда заранее видны <a href="{url}">{anchor}</a>.',
+            f'Если поездка завязана на событие, удобно заранее посмотреть <a href="{url}">{anchor}</a>.',
+            f'Такие поездки проще собирать, когда заранее видны <a href="{url}">{anchor}</a>.',
         ],
         "airport": [
-            f'Если впереди длинная пересадка, можно заранее посмотреть <a href="{url}">{anchor}</a>.',
-            f'В аэропорту спокойнее, когда заранее проверены <a href="{url}">{anchor}</a>.',
+            f'Если впереди долгая дорога, можно заранее посмотреть <a href="{url}">{anchor}</a>.',
+            f'Такие вещи удобнее проверить заранее через <a href="{url}">{anchor}</a>.',
         ],
         "general_bot": [
             f'Если хочется быстро сориентироваться, можно открыть <a href="{url}">{anchor}</a>.',
             f'Когда нужен общий подбор, удобнее посмотреть <a href="{url}">{anchor}</a>.',
         ],
         "general_travel": [
-            f'Если хочется прикинуть маршрут и формат отдыха, можно посмотреть <a href="{url}">{anchor}</a>.',
-            f'Когда нужна общая картина по поездке, удобно открыть <a href="{url}">{anchor}</a>.',
+            f'Если хочется спокойно сравнить общий формат поездки, можно открыть <a href="{url}">{anchor}</a>.',
+            f'Когда нужна общая картина по поездке, удобно посмотреть <a href="{url}">{anchor}</a>.',
         ],
         "cruises": [
             f'Если такой формат отдыха вам близок, можно заранее посмотреть <a href="{url}">{anchor}</a>.',
-            f'Такие маршруты удобнее сравнивать через <a href="{url}">{anchor}</a>.',
+            f'Такие маршруты удобнее сравнить через <a href="{url}">{anchor}</a>.',
         ],
         "rail_europe": [
             f'Если речь о маршрутах по Европе, удобнее заранее открыть <a href="{url}">{anchor}</a>.',
@@ -1089,12 +1040,6 @@ def build_native_link_paragraph(service: Dict[str, Any], template: str) -> str:
         options = [
             f'Когда вопрос уже актуален, проще сразу посмотреть <a href="{url}">{anchor}</a>.',
             f'Если не хочется терять время на лишние сравнения, можно быстро проверить <a href="{url}">{anchor}</a>.',
-        ] + options
-
-    if template == "news_events":
-        options = [
-            f'Если тема зацепила, можно сразу посмотреть <a href="{url}">{anchor}</a>.',
-            f'Если захочется развить эту идею в поездку, можно открыть <a href="{url}">{anchor}</a>.',
         ] + options
 
     return random.choice(options)
@@ -1208,7 +1153,6 @@ def build_template_instruction(template: str) -> str:
         "selling": "Сделай мягко продающий пост без прямой рекламы, через проблему и решение.",
         "mini_poll": "Сделай мини-анкету или быстрый опрос.",
         "short": "Сделай короткий ситуативный пост в 2–4 абзаца.",
-        "news_events": "Сделай живой пост про travel-событие, инфоповод, маршрут, тренд или повод для поездки. Важно не скатываться в сухую новость и не выдумывать точные даты, имена и цифры, если тема их не содержит. Делай акцент на том, почему читателю это интересно и как это может превратиться в идею поездки.",
         "special_low_price_map": "Сделай пост на тему карты низких цен на авиабилеты. Это должен быть полезный, понятный и живой пост.",
         "special_hot_tours": "Сделай пост на тему горящих туров. Это должен быть живой и удобный для Telegram пост.",
         "special_hotels_discount": "Сделай пост на тему отелей со скидкой до 80%.",
@@ -1219,8 +1163,6 @@ def build_template_instruction(template: str) -> str:
 def template_forbidden_rules(template: str) -> str:
     if template in NO_LINK_TEMPLATES:
         return "Не намекай на сервисы и не пиши про ботов или ссылки."
-    if template == "news_events":
-        return "Не упоминай бренды сервисов и не вставляй ссылки сам. Не выдумывай точные факты, если тема их не содержит."
     return "Не упоминай бренды сервисов и не вставляй ссылки сам."
 
 
@@ -1229,8 +1171,6 @@ def template_structure_hint(template: str) -> str:
         return "Структура: короткий заголовок, 2–3 коротких абзаца, короткий вывод."
     if template in {"selection", "expert", "selling"}:
         return "Структура: заголовок, заход, 3 смысловых блока, вывод."
-    if template == "news_events":
-        return "Структура: короткий заголовок, яркий заход, 2–3 коротких блока, зачем это читателю, короткий финал."
     return "Структура: заголовок, заход, 2–3 смысловых блока, вывод."
 
 
@@ -1263,8 +1203,8 @@ async def generate_post_via_openai(topic: str, template: str) -> str:
 - делай абзацы короткими
 - не делай одинаковый шаблонный тон
 - не превращай текст в скучную памятку
-- если тема про место, маршрут или событие — добавь атмосферу и повод заинтересоваться
-- если тема про пользу — давай конкретику, а не общие фразы
+- если тема про место, формат отдыха или атмосферу — добавь ощущение живого интереса
+- если тема про пользу — дай конкретику, а не общие слова
 - {template_forbidden_rules(template)}
 
 Инструкция:
@@ -1278,7 +1218,7 @@ async def generate_post_via_openai(topic: str, template: str) -> str:
         temperature=1.05,
         max_tokens=900,
         messages=[
-            {"role": "system", "content": "Ты сильный редактор Telegram-канала про путешествия, вовлечение, рост подписчиков и нативную монетизацию."},
+            {"role": "system", "content": "Ты сильный редактор Telegram-канала про путешествия, рост охватов и нативную монетизацию."},
             {"role": "user", "content": prompt},
         ],
     )
@@ -1487,6 +1427,7 @@ def update_post_status(post_id: int, status: str):
 def build_special_post(now_dt: datetime, slot_index: int, total_slots: int) -> Optional[Dict[str, str]]:
     weekday = now_dt.weekday()
 
+    # Вторник, 2-й пост дня
     if weekday == 1 and slot_index == 2:
         return {
             "template": "special_low_price_map",
@@ -1495,6 +1436,7 @@ def build_special_post(now_dt: datetime, slot_index: int, total_slots: int) -> O
             "service_key": "special_low_price_map",
         }
 
+    # Четверг, последний пост дня
     if weekday == 3 and slot_index == total_slots:
         return {
             "template": "special_hot_tours",
@@ -1503,6 +1445,7 @@ def build_special_post(now_dt: datetime, slot_index: int, total_slots: int) -> O
             "service_key": "special_hot_tours",
         }
 
+    # Пятница, 2-й пост дня
     if weekday == 4 and slot_index == 2:
         return {
             "template": "special_hotels_discount",
@@ -1810,7 +1753,7 @@ async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Версия: {APP_VERSION}\n"
         f"Автопостинг: {enabled}\n"
         f"Время публикаций (UTC+3): {schedule_raw}\n"
-        f"Статистика типов: {stats_text}"
+        f"Скользящая статистика типов: {stats_text}"
     )
 
 
