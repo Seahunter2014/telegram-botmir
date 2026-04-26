@@ -22,8 +22,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
 
-APP_VERSION = "travel-matrix-v10-human-tone"
-
+APP_VERSION = "travel-matrix-v11-signal-engine"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
@@ -101,9 +100,9 @@ MODE_TEMPLATE_WEIGHTS: Dict[str, Dict[str, int]] = {
 
 SIGNAL_KIND_KEYWORDS: Dict[str, List[str]] = {
     "offer": ["скид", "дешев", "акци", "распродаж", "горящ", "цена", "билет", "тур", "отель", "перелет"],
-    "useful": ["как", "ошиб", "почему", "что проверить", "совет", "правил", "документ", "страхов", "багаж"],
+    "useful": ["как", "ошиб", "почему", "что проверить", "совет", "правил", "документ", "страхов", "багаж", "виза", "внж", "вид на жительство", "шенген", "паспорт", "границ"],
     "engagement": ["что выбрать", "вы бы", "опрос", "вопрос", "угадай", "голос", "или"],
-    "idea": ["куда поехать", "мест", "страна", "город", "курорт", "маршрут", "фестиваль", "интересн", "пляж"],
+    "idea": ["куда поехать", "мест", "страна", "город", "курорт", "маршрут", "фестиваль", "интересн", "пляж", "водопад", "парк", "ресторан", "кафе", "арктик", "кругосвет"],
 }
 
 DEFAULT_SIGNAL_SOURCES = "\n".join([
@@ -123,6 +122,59 @@ DEFAULT_SIGNAL_SOURCES = "\n".join([
     "web_list|ATOR outbound|https://www.atorus.ru/taxonomy/term/7",
     "web_list|ATOR domestic|https://www.atorus.ru/vnetrenniy-turizm",
 ])
+
+BLOCKED_SIGNAL_SOURCE_NAMES = {
+    "tripmydream",
+}
+
+BLOCKED_SIGNAL_KEYWORDS = [
+    "украин",
+    "україн",
+    "ukraine",
+    "украина",
+    "україна",
+    "украинский",
+    "український",
+    "киев",
+    "київ",
+    "kyiv",
+    "львов",
+    "львів",
+    "lviv",
+    "одесса",
+    "одеса",
+    "odesa",
+    "харьков",
+    "харків",
+    "kharkiv",
+    "укрзалізниця",
+    "укрзализныця",
+    "укрзализниця",
+]
+
+WHITELIST_THEME_KEYWORDS = {
+    "visa": [
+        "виза", "визы", "внж", "вид на жительство", "шенген", "въезд", "правила въезда",
+        "безвиз", "паспорт", "документы", "для граждан рф", "россиян", "гражданам рф",
+    ],
+    "locations": [
+        "пляж", "пляжи", "водопад", "водопады", "парк", "парки", "парк аттракционов",
+        "аттракцион", "ресторан", "кафе", "локаци", "курорт", "остров", "бухта",
+        "необычный тур", "арктика", "кругосвет", "сафари", "яхт", "круиз",
+    ],
+    "events": [
+        "чемпионат", "евро", "world cup", "кубок", "лига чемпионов", "матч", "футбол",
+        "концерт", "звезда", "фестиваль", "выставка", "шоу", "формула 1", "гран-при",
+    ],
+}
+
+WHITELIST_DESTINATION_KEYWORDS = [
+    "дубай", "оаэ", "турция", "стамбул", "анталья", "армения", "ереван", "грузия", "тбилиси",
+    "батуми", "азия", "таиланд", "тайланд", "тай", "пхукет", "банкок", "вьетнам", "бали",
+    "индонезия", "малайзия", "сингапур", "китай", "япония", "корея", "европа", "италия",
+    "франция", "испания", "германия", "португалия", "греция", "сербия", "черногория",
+    "америка", "сша", "нью-йорк", "лос-анджелес", "майами",
+]
 
 POST_TEMPLATES: Dict[str, int] = {
     "useful": 12,
@@ -842,11 +894,51 @@ def parse_signal_sources(raw: str) -> List[Dict[str, str]]:
         result.append({"type": parts[0], "name": parts[1], "url": parts[2]})
     return result
 
-def save_signal(title: str, summary: str, url: str, source_name: str, source_type: str, signal_kind: str, score: int = 0) -> None:
+def contains_blocked_signal_content(title: str, summary: str, source_name: str = "") -> bool:
+    haystack = normalize_text(f"{title} {summary} {source_name}")
+    source_norm = normalize_text(source_name)
+    if source_norm in BLOCKED_SIGNAL_SOURCE_NAMES:
+        return True
+    if any(keyword in haystack for keyword in BLOCKED_SIGNAL_KEYWORDS):
+        return True
+    if re.search(r"[іїєґІЇЄҐ]", f"{title} {summary}"):
+        return True
+    return False
+
+def signal_whitelist_bonus(title: str, summary: str, source_name: str = "") -> int:
+    haystack = normalize_text(f"{title} {summary} {source_name}")
+    bonus = 0
+    matched_groups = 0
+    for keywords in WHITELIST_THEME_KEYWORDS.values():
+        if any(keyword in haystack for keyword in keywords):
+            bonus += 3
+            matched_groups += 1
+    if any(keyword in haystack for keyword in WHITELIST_DESTINATION_KEYWORDS):
+        bonus += 2
+    if "для граждан рф" in haystack or "гражданам рф" in haystack or "россиян" in haystack:
+        bonus += 3
+    if matched_groups >= 2:
+        bonus += 2
+    return bonus
+
+def purge_blocked_signals() -> int:
+    removed = 0
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT id, title, summary, source_name FROM content_signals").fetchall()
+        for row in rows:
+            if contains_blocked_signal_content(row["title"] or "", row["summary"] or "", row["source_name"] or ""):
+                conn.execute("DELETE FROM content_signals WHERE id=?", (row["id"],))
+                removed += 1
+        conn.commit()
+    return removed
+
+def save_signal(title: str, summary: str, url: str, source_name: str, source_type: str, signal_kind: str, score: int = 0) -> bool:
     normalized_url = normalize_url(url)
     normalized_title = title.strip()
     if not normalized_title:
-        return
+        return False
+    if contains_blocked_signal_content(normalized_title, summary.strip(), source_name):
+        return False
     with closing(db()) as conn:
         exists = conn.execute(
             """
@@ -857,7 +949,7 @@ def save_signal(title: str, summary: str, url: str, source_name: str, source_typ
             (normalized_title, source_name, normalized_url),
         ).fetchone()
         if exists:
-            return
+            return False
         conn.execute(
             """
             INSERT INTO content_signals(title, summary, url, source_name, source_type, signal_kind, score, used, created_at)
@@ -866,6 +958,7 @@ def save_signal(title: str, summary: str, url: str, source_name: str, source_typ
             (normalized_title, summary.strip(), normalized_url, source_name, source_type, signal_kind, score, now_iso()),
         )
         conn.commit()
+        return True
 
 def discover_signals_from_web_list(name: str, url: str) -> int:
     html_text = fetch_url(url)
@@ -876,16 +969,18 @@ def discover_signals_from_web_list(name: str, url: str) -> int:
         title = strip_html_tags(raw)
         if len(title) >= 18:
             kind = classify_signal_kind(title, "")
-            save_signal(title, "", url, name, "web_list", kind, score=5)
-            saved += 1
+            score = 5 + signal_whitelist_bonus(title, "", name)
+            if save_signal(title, "", url, name, "web_list", kind, score=score):
+                saved += 1
     for href, raw_text in links[:30]:
         text = strip_html_tags(raw_text)
         if len(text) < 18:
             continue
         final_url = href if href.startswith("http") else url
         kind = classify_signal_kind(text, "")
-        save_signal(text, "", final_url, name, "web_list", kind, score=3)
-        saved += 1
+        score = 3 + signal_whitelist_bonus(text, "", name)
+        if save_signal(text, "", final_url, name, "web_list", kind, score=score):
+            saved += 1
     return saved
 
 def discover_signals_from_public_telegram(name: str, url: str) -> int:
@@ -896,26 +991,42 @@ def discover_signals_from_public_telegram(name: str, url: str) -> int:
         re.I,
     )
     saved = 0
+    source_name_norm = name.lower()
+    saved_per_source = 0
     for raw_text, _dt in posts[:12]:
         text = strip_html_tags(raw_text)
         if len(text) < 35:
             continue
         title = text.split(".")[0][:140].strip(" -")
         summary = text[:350]
+        if contains_blocked_signal_content(title, summary, name):
+            continue
         kind = classify_signal_kind(title, summary)
         base_score = 6
-        source_name_norm = name.lower()
         if source_name_norm in {"travelata", "leveltravel", "aviasales", "tripmydream", "klooktravelsg"}:
             base_score = 9
         elif source_name_norm in {"planet earth", "travelpics", "wonderful_globe", "amazing world and travel", "nomadslens", "globetrekker"}:
             base_score = 7
-        save_signal(title or summary[:120], summary, url, name, "telegram_public", kind, score=base_score)
-        saved += 1
+        if source_name_norm == "klooktravelsg":
+            base_score = 5
+        elif source_name_norm == "aviasales":
+            base_score = 8
+        elif source_name_norm in {"travelata", "leveltravel"}:
+            base_score = 8
+        elif source_name_norm in {"planet earth", "travelpics", "wonderful_globe", "amazing world and travel", "nomadslens", "globetrekker"}:
+            base_score = 6
+        final_score = base_score + signal_whitelist_bonus(title, summary, name)
+        if saved_per_source >= 4:
+            break
+        if save_signal(title or summary[:120], summary, url, name, "telegram_public", kind, score=final_score):
+            saved += 1
+            saved_per_source += 1
     return saved
 
 def discover_public_signals(force: bool = False) -> int:
     if get_setting("signals_enabled", "1") != "1":
         return 0
+    purge_blocked_signals()
     refresh_hours = int(get_setting("signals_refresh_hours", "8") or "8")
     last_run_raw = get_setting("signals_last_refresh_at", "")
     if not force and last_run_raw:
@@ -2144,9 +2255,10 @@ async def set_test_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 @admin_only
 async def refresh_signals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update, "Обновляю сигналы из публичных источников...")
+    removed = purge_blocked_signals()
     inserted = discover_public_signals(force=True)
     rows = list_signals(limit=10, only_unused=True)
-    text = f"Готово. Добавлено/обновлено сигналов: {inserted}\n\n"
+    text = f"Готово. Добавлено/обновлено сигналов: {inserted}\nУдалено нежелательных сигналов: {removed}\n\n"
     if not rows:
         text += "Сигналов пока нет."
     else:
