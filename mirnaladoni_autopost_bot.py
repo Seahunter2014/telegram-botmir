@@ -16,13 +16,13 @@ import httpx
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import Forbidden
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
 
-APP_VERSION = "travel-matrix-v11-signal-engine"
+APP_VERSION = "travel-matrix-v12-signal-engine"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
@@ -216,13 +216,13 @@ TEMPLATE_LENGTH_CLASS = {
 }
 
 LENGTH_RANGES = {
-    "short": (300, 550),
-    "medium": (550, 850),
-    "long": (700, 950),
+    "short": (350, 650),
+    "medium": (650, 1100),
+    "long": (900, 1450),
 }
 
-NO_LINK_TEMPLATES = {"engagement", "provocation", "trust", "mini_poll"}
-OPTIONAL_LINK_TEMPLATES = {"useful", "selection", "expert", "mistake", "seasonal", "case", "short"}
+NO_LINK_TEMPLATES = set()
+OPTIONAL_LINK_TEMPLATES = {"useful", "selection", "expert", "mistake", "seasonal", "case", "short", "engagement", "provocation", "trust", "mini_poll"}
 FORCED_LINK_TEMPLATES = {"selling", "special_low_price_map", "special_hot_tours", "special_hotels_discount"}
 
 SERVICES: List[Dict[str, Any]] = [
@@ -844,11 +844,11 @@ def get_next_topic() -> Tuple[str, str]:
             conn.commit()
             return row["topic_text"], row["source_type"]
     fallback = random.choice([
-        "5 ошибок при бронировании отпуска",
-        "Как выставка, матч или концерт могут стать поводом для поездки",
-        "Почему маленькие приморские города иногда лучше раскрученных курортов",
-        "Что важнее в отпуске: экономия, комфорт или впечатления",
-        "Когда аренда авто действительно делает поездку удобнее",
+        "Идея для путешествия, которая может вдохновить на ближайший отпуск",
+        "Место, ради которого хочется собрать маршрут уже сегодня",
+        "Событие, под которое можно придумать яркую поездку",
+        "Необычный формат отдыха, который дарит настоящие впечатления",
+        "Направление, куда приятно поехать без суеты и с интересом",
     ])
     return fallback, "fallback"
 
@@ -1276,10 +1276,13 @@ def should_insert_links(template: str, recent_posts, groups: Optional[List[str]]
         return False
     if template in FORCED_LINK_TEMPLATES:
         return True
-    if template in {"useful", "expert", "mistake", "seasonal", "selection"} and groups:
-        strong = [g for g in groups if g not in {"general_bot", "general_travel"}]
-        if strong:
-            return True
+    strong = [g for g in groups if g not in {"general_bot", "general_travel"}]
+    if groups and strong:
+        if template in {"engagement", "provocation", "mini_poll"}:
+            return random.random() < 0.35
+        if template in {"trust", "short"}:
+            return random.random() < 0.55
+        return True
     if template in OPTIONAL_LINK_TEMPLATES:
         return random.random() < 0.45
     return False
@@ -1604,10 +1607,10 @@ def template_forbidden_rules(template: str) -> str:
 
 def template_structure_hint(template: str) -> str:
     if template in {"short", "mini_poll", "engagement", "provocation"}:
-        return "Структура: короткий заголовок, 2–3 коротких абзаца, короткий вывод."
+        return "Структура: сильный заход, 2–3 коротких абзаца, живая концовка."
     if template in {"selection", "expert", "selling"}:
-        return "Структура: заголовок, заход, 3 смысловых блока, вывод."
-    return "Структура: заголовок, заход, 2–3 смысловых блока, вывод."
+        return "Структура: яркий заход, 2–4 смысловых блока, человеческий финал."
+    return "Структура: живой заход, 2–4 смысловых блока, теплая концовка."
 
 async def generate_post_via_openai(
     topic: str,
@@ -1789,8 +1792,74 @@ def format_post_card(row) -> str:
         f"{row['content']}"
     )
 
+def services_from_row(row) -> List[Dict[str, Any]]:
+    services: List[Dict[str, Any]] = []
+    if not row or not row["referral_url"]:
+        return services
+    urls = [u.strip() for u in (row["referral_url"] or "").split(",") if u.strip()]
+    if (row["monetization_service"] or "").startswith("special_"):
+        special = {
+            "template": row["post_type"],
+            "url": urls[0] if urls else "",
+            "service_key": row["monetization_service"],
+        }
+        return [make_special_service(special)] if urls else []
+    for url in urls[:3]:
+        matched = next((s for s in SERVICES if s["url"] == url), None)
+        if matched:
+            services.append(matched)
+    return services
+
+def render_post_preview(row) -> str:
+    if not row:
+        return ""
+    recent_posts = get_recent_posts(7)
+    return format_post_text(
+        content=row["content"] or "",
+        template=row["post_type"] or "useful",
+        services=services_from_row(row),
+        recent_posts=recent_posts,
+        photo_credit=row["photo_credit"],
+        photo_source_url=row["photo_source_url"],
+        max_plain_len=4096,
+    )
+
 def build_link_blocks(services: List[Dict[str, Any]], template: str) -> List[str]:
     return [build_native_link_paragraph(service, template) for service in services[:3]]
+
+def service_button_text(service: Dict[str, Any]) -> str:
+    category = service.get("category", "")
+    mapping = {
+        "tours": "Лучшие туры",
+        "flights": "Доступные билеты",
+        "hotels": "Забронировать отель",
+        "insurance": "Страховка",
+        "excursions": "Что посмотреть",
+        "transfer": "Трансфер",
+        "car_rental": "Аренда авто",
+        "events": "Билеты на события",
+        "general_travel": "Варианты поездки",
+        "general_bot": "Подобрать поездку",
+    }
+    return mapping.get(category, "Полезная ссылка")
+
+def build_inline_buttons(services: List[Dict[str, Any]], post_id: int) -> Optional[InlineKeyboardMarkup]:
+    rows: List[List[InlineKeyboardButton]] = []
+    service_buttons: List[InlineKeyboardButton] = []
+    used_urls = set()
+    for service in services[:2]:
+        url = service.get("url", "").strip()
+        if not url or url in used_urls:
+            continue
+        used_urls.add(url)
+        service_buttons.append(InlineKeyboardButton(service_button_text(service), url=url))
+    if service_buttons:
+        rows.append(service_buttons)
+    if post_id % 10 == 0:
+        rows.append([InlineKeyboardButton("ТурДжин", url="https://t.me/TourJin_bot")])
+    else:
+        rows.append([InlineKeyboardButton("Подписаться на канал", url="https://t.me/NadoTurKrd")])
+    return InlineKeyboardMarkup(rows) if rows else None
 
 def format_post_text(
     content: str,
@@ -1799,6 +1868,7 @@ def format_post_text(
     recent_posts,
     photo_credit: Optional[str],
     photo_source_url: Optional[str],
+    max_plain_len: int = 4096,
 ) -> str:
     base_html = convert_plain_text_to_html(content)
     blocks = []
@@ -1819,13 +1889,13 @@ def format_post_text(
     plain_base = re.sub(r"<[^>]+>", "", base_html)
     plain_ending = re.sub(r"<[^>]+>", "", ending_html)
     plain_credit = re.sub(r"<[^>]+>", "", credit_block)
-    max_base_len = 1024 - len(plain_ending) - len(plain_credit) - 4
+    max_base_len = max_plain_len - len(plain_ending) - len(plain_credit) - 4
     trimmed_plain_base = trim_to_limit(plain_base, max(180, max_base_len))
     base_html = convert_plain_text_to_html(trimmed_plain_base)
     final_html = f"{base_html}\n\n{ending_html}{credit_block}".strip() if ending_html else f"{base_html}{credit_block}".strip()
     final_plain = re.sub(r"<[^>]+>", "", final_html)
-    if len(final_plain) > 1024:
-        overflow = len(final_plain) - 1024
+    if len(final_plain) > max_plain_len:
+        overflow = len(final_plain) - max_plain_len
         trimmed_plain_base = trim_to_limit(trimmed_plain_base, max(160, len(trimmed_plain_base) - overflow - 10))
         base_html = convert_plain_text_to_html(trimmed_plain_base)
         final_html = f"{base_html}\n\n{ending_html}{credit_block}".strip() if ending_html else f"{base_html}{credit_block}".strip()
@@ -1988,13 +2058,21 @@ async def publish_post_record(bot, channel_id: str, row, mark_status: str = "pub
         recent_posts=recent_posts,
         photo_credit=row["photo_credit"],
         photo_source_url=row["photo_source_url"],
+        max_plain_len=4096,
     )
+    reply_markup = build_inline_buttons(services, row["id"])
     photo_path = row["photo_path"]
+    plain_text_len = len(re.sub(r"<[^>]+>", "", text))
     if photo_path and Path(photo_path).exists():
-        with open(photo_path, "rb") as photo_file:
-            await bot.send_photo(chat_id=channel_id, photo=photo_file, caption=text, parse_mode="HTML")
+        if plain_text_len <= 1024:
+            with open(photo_path, "rb") as photo_file:
+                await bot.send_photo(chat_id=channel_id, photo=photo_file, caption=text, parse_mode="HTML", reply_markup=reply_markup)
+        else:
+            with open(photo_path, "rb") as photo_file:
+                await bot.send_photo(chat_id=channel_id, photo=photo_file)
+            await bot.send_message(chat_id=channel_id, text=text, parse_mode="HTML", disable_web_page_preview=False, reply_markup=reply_markup)
     else:
-        await bot.send_message(chat_id=channel_id, text=text, parse_mode="HTML", disable_web_page_preview=False)
+        await bot.send_message(chat_id=channel_id, text=text, parse_mode="HTML", disable_web_page_preview=False, reply_markup=reply_markup)
     update_post_status(row["id"], mark_status)
 
 async def scheduled_autopost_job(app: Application):
@@ -2097,13 +2175,42 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic = " ".join(context.args).strip() if context.args else ""
     if not topic:
-        topic, source_type = get_next_topic()
+        item = get_next_content_input()
+        topic = item["topic"]
+        source_type = item["source_type"]
+        content_mode = item["content_mode"]
+        signal_title = item["signal_title"]
+        signal_summary = item["signal_summary"]
+        signal_url = item["signal_url"]
+        signal_source_name = item["signal_source_name"]
+        signal_kind = item["signal_kind"]
     else:
         source_type = "manual"
+        content_mode = "idea"
+        signal_title = ""
+        signal_summary = ""
+        signal_url = ""
+        signal_source_name = ""
+        signal_kind = ""
     await safe_reply(update, f"Генерирую пост по теме: {topic}")
-    post_id = await create_post_record(topic=topic, source_type=source_type, goal="manual", forced_post_type=None)
+    post_id = await create_post_record(
+        topic=topic,
+        source_type=source_type,
+        goal="manual",
+        content_mode=content_mode,
+        signal_title=signal_title,
+        signal_summary=signal_summary,
+        signal_url=signal_url,
+        signal_source_name=signal_source_name,
+        signal_kind=signal_kind,
+        forced_post_type=None,
+    )
     row = get_post(post_id)
-    await safe_reply(update, f"Пост создан.\n\n{format_post_card(row)}\n\nДля публикации: /publish {post_id}\nДля теста: /test_post {post_id}")
+    preview = render_post_preview(row)
+    await safe_reply(
+        update,
+        f"Пост создан.\n\n{format_post_card(row)}\n\nФинальный вид при публикации:\n\n{preview}\n\nДля публикации: /publish {post_id}\nДля теста: /test_post {post_id}"
+    )
 
 @admin_only
 async def publish_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
