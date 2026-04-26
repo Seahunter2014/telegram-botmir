@@ -22,7 +22,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
 
-APP_VERSION = "travel-matrix-v9-signal-engine"
+APP_VERSION = "travel-matrix-v10-human-tone"
+
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
@@ -219,7 +220,7 @@ SERVICES: List[Dict[str, Any]] = [
         "category": "tours",
         "url": "https://onlinetours.tp.st/Um2ycow9",
         "keywords": ["тур", "туры", "путевка", "путёвка", "пакетный тур", "all inclusive"],
-        "anchor_options": ["варианты тура", "туры по направлению", "пакетные туры"],
+        "anchor_options": ["лучшие туры", "готовые туры", "поездки под ключ"],
         "priority": 9,
         "is_active": True,
     },
@@ -229,7 +230,7 @@ SERVICES: List[Dict[str, Any]] = [
         "category": "tours",
         "url": "https://travelata.tp.st/O6m2Lg6H",
         "keywords": ["горящий тур", "горящие туры", "тур", "туры", "спецпредложения"],
-        "anchor_options": ["горящие туры", "туры со скидкой", "интересные туры"],
+        "anchor_options": ["лучшие туры", "туры со скидкой", "готовые туры"],
         "priority": 9,
         "is_active": True,
     },
@@ -373,30 +374,32 @@ CTA_CLASSES = {
         "А какой вариант ближе тебе?",
     ],
     "share": [
-        "Отправь тому, кто сейчас планирует поездку.",
-        "Поделись с тем, кому это может пригодиться.",
-        "Перешли другу, который как раз собирается в отпуск.",
-        "Поделись с тем, кто любит ловить выгодные варианты.",
+        "Отправь тому, с кем давно хочется куда-нибудь выбраться.",
+        "Поделись с тем, кому сейчас особенно нужны идеи для поездки.",
+        "Перешли другу, с которым вы все откладываете отпуск.",
+        "Сохрани или отправь тому, кто любит находить классные варианты раньше других.",
     ],
     "subscribe": [
-        "Подпишись, если нужны ещё такие разборы.",
-        "В канале ещё будут такие короткие travel-разборы.",
-        "Если нравятся такие travel-подсказки — оставайся в канале.",
-        "Подпишись, здесь ещё будут полезные идеи для поездок.",
+        "Читайте канал, здесь мы регулярно собираем идеи, сервисы и лайфхаки для путешествий.",
+        "Оставайтесь с нами: впереди еще много маршрутов, находок и полезных сервисов.",
+        "Подписывайтесь, если любите путешествия с удовольствием, а не в спешке.",
+        "В канале еще будет много красивых и полезных идей для ваших поездок.",
     ],
     "soft_sell": [
-        "Если вопрос уже актуален, удобнее проверить варианты заранее.",
-        "Когда тема горит, лучше быстро сравнить всё в одном месте.",
-        "Если планируешь поездку уже сейчас, не откладывай проверку вариантов.",
-        "Когда поездка на горизонте, лучше сразу посмотреть всё спокойно.",
+        "Если идея вам откликается, можно спокойно сравнить разные варианты и выбрать свой формат поездки.",
+        "Понравилось направление? Самое время посмотреть, какие варианты путешествия сейчас доступны.",
+        "Когда начинаешь готовиться заранее, поездка обычно получается и спокойнее, и приятнее.",
+        "Иногда один удачно найденный вариант уже задает настроение всему будущему отпуску.",
     ],
     "none": [
-        "Иногда одна проверка экономит весь отпуск.",
-        "На таких мелочах поездка и собирается.",
-        "Именно такие детали потом решают всё впечатление от отдыха.",
-        "В путешествиях мелочей почти не бывает.",
+        "Путешествие всегда начинается с хорошей идеи, а дальше уже складываются детали.",
+        "Именно из таких деталей потом и рождаются самые теплые впечатления.",
+        "Чем спокойнее подготовка, тем больше удовольствия от самой поездки.",
+        "Пусть каждое путешествие приносит не суету, а радость и яркие эмоции.",
     ],
 }
+
+BRAND_SIGNATURE_HTML = 'С любовью, <a href="https://t.me/NadoTurKrd">Мир на ладони</a>'
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -722,9 +725,12 @@ def slugify(text: str, max_len: int = 60) -> str:
 
 def cleanup_post_text(text: str) -> str:
     text = text.replace("***", "").replace("**", "").replace("__", "")
+    text = re.sub(r"^\s*Заголовок\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\s*Title\s*:\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"^([^\w\s])(\d)", r"\1 \2", text)
+    text = re.sub(r"\n\s*Заголовок\s*:\s*", "\n", text, flags=re.IGNORECASE)
     return text.strip()
 
 def looks_incomplete(text: str) -> bool:
@@ -1192,13 +1198,20 @@ def choose_services(topic: str, content: str, template: str, recent_posts) -> Li
         candidates = final_candidates
     if not candidates:
         return []
+    max_links = 3 if template in {"selection", "selling", "seasonal", "case"} else 2
     chosen: List[Dict[str, Any]] = [candidates[0]]
-    if template in {"selection", "selling", "seasonal"} and len(candidates) > 1 and random.random() < 0.30:
+    used_categories = {candidates[0]["category"]}
+    if template in {"selection", "selling", "seasonal", "case"} and len(candidates) > 1:
         for candidate in candidates[1:]:
-            if candidate["key"] != chosen[0]["key"]:
-                chosen.append(candidate)
+            if candidate["key"] == chosen[0]["key"]:
+                continue
+            if candidate["category"] in used_categories:
+                continue
+            chosen.append(candidate)
+            used_categories.add(candidate["category"])
+            if len(chosen) >= max_links:
                 break
-    return chosen[:2]
+    return chosen[:max_links]
 
 def choose_cta_class(template: str, recent_posts) -> str:
     preferred = {
@@ -1237,65 +1250,128 @@ def build_cta(template: str, recent_posts) -> str:
 def choose_anchor_text(service: Dict[str, Any]) -> str:
     return random.choice(service["anchor_options"])
 
+def build_brand_hashtags(content: str, template: str, services: List[Dict[str, Any]]) -> str:
+    base_tags = ["#МирНаЛадони", "#ПутешествиеМечты", "#Турджин"]
+    haystack = normalize_text(content)
+    extra_tags: List[str] = []
+
+    keyword_map = [
+        ("авиабилет", "#Авиабилеты"),
+        ("перел", "#ДешевыеПерелеты"),
+        ("отел", "#Отели"),
+        ("жиль", "#ОтдыхСКомфортом"),
+        ("тур", "#ГотовыеТуры"),
+        ("море", "#ОтдыхУМоря"),
+        ("пляж", "#ПляжныйОтдых"),
+        ("егип", "#Египет"),
+        ("турци", "#Турция"),
+        ("дубай", "#ОАЭ"),
+        ("виза", "#ЛайфхакиДляПутешествий"),
+        ("страхов", "#БезопасноеПутешествие"),
+        ("экскурс", "#ИдеиДляПутешествий"),
+        ("выходн", "#ИдеиНаУикенд"),
+        ("уикенд", "#ИдеиНаУикенд"),
+        ("событи", "#КудаПоехать"),
+        ("маршрут", "#МаршрутыМечты"),
+    ]
+    for needle, tag in keyword_map:
+        if needle in haystack and tag not in extra_tags:
+            extra_tags.append(tag)
+        if len(extra_tags) >= 2:
+            break
+
+    if len(extra_tags) < 2:
+        category_map = {
+            "tours": "#ГотовыеТуры",
+            "flights": "#Авиабилеты",
+            "hotels": "#Отели",
+            "excursions": "#ИдеиДляПутешествий",
+            "insurance": "#ЛайфхакиДляПутешествий",
+            "general_travel": "#КудаПоехать",
+            "general_bot": "#ПланируемОтпуск",
+        }
+        for service in services:
+            tag = category_map.get(service.get("category", ""))
+            if tag and tag not in extra_tags:
+                extra_tags.append(tag)
+            if len(extra_tags) >= 2:
+                break
+
+    if len(extra_tags) < 2:
+        fallback_by_template = {
+            "selling": ["#ПланируемОтпуск", "#КудаПоехать"],
+            "selection": ["#КудаПоехать", "#ИдеиДляПутешествий"],
+            "seasonal": ["#ИдеиДляПутешествий", "#ПланируемОтпуск"],
+            "useful": ["#ЛайфхакиДляПутешествий", "#ПланируемОтпуск"],
+            "mistake": ["#ЛайфхакиДляПутешествий", "#ПутешествиеБезСтресса"],
+        }
+        for tag in fallback_by_template.get(template, ["#КудаПоехать", "#ПланируемОтпуск"]):
+            if tag not in extra_tags:
+                extra_tags.append(tag)
+            if len(extra_tags) >= 2:
+                break
+
+    return " ".join(base_tags + extra_tags[:2])
+
 def build_native_link_paragraph(service: Dict[str, Any], template: str) -> str:
     url = service["url"]
     anchor = escape_html_text(choose_anchor_text(service))
     base_templates = {
         "hotels": [
-            f'Если хочется спокойно сравнить варианты — можно посмотреть <a href="{url}">{anchor}</a>.',
-            f'Обычно такие вещи удобнее проверять через <a href="{url}">{anchor}</a>.',
+            f'Если захочется собрать поездку под свой вкус и бюджет, можно спокойно посмотреть <a href="{url}">{anchor}</a>.',
+            f'Когда хочется больше комфорта и меньше хаоса в поиске, удобно заранее открыть <a href="{url}">{anchor}</a>.',
         ],
         "tours": [
-            f'Когда вопрос уже актуален, проще заранее посмотреть <a href="{url}">{anchor}</a>.',
-            f'Часто выгоднее сначала сравнить <a href="{url}">{anchor}</a>.',
+            f'Понравилась идея? Можно спокойно сравнить <a href="{url}">{anchor}</a> на нужные даты и направление.',
+            f'Если хочется упростить подготовку, посмотрите <a href="{url}">{anchor}</a> и выберите свой вариант поездки.',
         ],
         "flights": [
-            f'Иногда дешевле просто заранее проверить <a href="{url}">{anchor}</a>.',
-            f'В такие моменты лучше быстро открыть <a href="{url}">{anchor}</a>.',
+            f'Для старта путешествия удобно заранее проверить <a href="{url}">{anchor}</a> и понять вилку цен.',
+            f'Иногда именно удачный перелёт задаёт настроение всей поездке — посмотрите <a href="{url}">{anchor}</a>.',
         ],
         "insurance": [
-            f'Перед вылетом лучше один раз проверить <a href="{url}">{anchor}</a>.',
-            f'В подобных случаях разумнее заранее открыть <a href="{url}">{anchor}</a>.',
+            f'Чтобы путешествовать спокойнее, перед вылетом стоит заранее посмотреть <a href="{url}">{anchor}</a>.',
+            f'Для уверенности в дороге можно заранее выбрать <a href="{url}">{anchor}</a>.',
         ],
         "excursions": [
-            f'Если хотите не потерять хорошие варианты, можно заранее посмотреть <a href="{url}">{anchor}</a>.',
-            f'Часто удобнее заранее выбрать <a href="{url}">{anchor}</a>.',
+            f'Чтобы впечатлений в поездке было больше, заранее посмотрите <a href="{url}">{anchor}</a>.',
+            f'Если хочется наполнить маршрут эмоциями, удобно заранее выбрать <a href="{url}">{anchor}</a>.',
         ],
         "transfer": [
-            f'После позднего прилёта спокойнее заранее проверить <a href="{url}">{anchor}</a>.',
-            f'Чтобы не метаться на месте, можно заранее открыть <a href="{url}">{anchor}</a>.',
+            f'Чтобы после прилёта всё было спокойно и без суеты, можно заранее посмотреть <a href="{url}">{anchor}</a>.',
+            f'Если не хочется решать логистику на месте, удобно заранее открыть <a href="{url}">{anchor}</a>.',
         ],
         "car_rental": [
-            f'В таких поездках часто удобнее заранее сравнить <a href="{url}">{anchor}</a>.',
-            f'Если маршрут плотный, лучше сразу посмотреть <a href="{url}">{anchor}</a>.',
+            f'Для свободы в маршруте удобно заранее сравнить <a href="{url}">{anchor}</a>.',
+            f'Если хочется увидеть больше за одну поездку, посмотрите <a href="{url}">{anchor}</a>.',
         ],
         "ground_transport": [
-            f'Иногда проще заранее проверить <a href="{url}">{anchor}</a>.',
-            f'В таких маршрутах стоит заранее открыть <a href="{url}">{anchor}</a>.',
+            f'Для спокойного маршрута без спешки удобно заранее проверить <a href="{url}">{anchor}</a>.',
+            f'Если поездка состоит из нескольких переездов, заранее посмотрите <a href="{url}">{anchor}</a>.',
         ],
         "events": [
-            f'Если поездка завязана на событие, удобно заранее посмотреть <a href="{url}">{anchor}</a>.',
-            f'Такие поездки проще собирать, когда заранее видны <a href="{url}">{anchor}</a>.',
+            f'Если хочется поехать под конкретное событие, заранее посмотрите <a href="{url}">{anchor}</a>.',
+            f'Такие поездки особенно приятно собирать, когда под рукой уже есть <a href="{url}">{anchor}</a>.',
         ],
         "airport": [
-            f'Если впереди долгая дорога, можно заранее посмотреть <a href="{url}">{anchor}</a>.',
-            f'Такие вещи удобнее проверить заранее через <a href="{url}">{anchor}</a>.',
+            f'Если впереди длинная дорога или пересадка, заранее посмотрите <a href="{url}">{anchor}</a>.',
+            f'Для более комфортного пути удобно заранее проверить <a href="{url}">{anchor}</a>.',
         ],
         "general_bot": [
-            f'Если хочется быстро сориентироваться, можно открыть <a href="{url}">{anchor}</a>.',
-            f'Когда нужен общий подбор, удобнее посмотреть <a href="{url}">{anchor}</a>.',
+            f'Если хочется быстро собрать варианты под свой запрос, можно открыть <a href="{url}">{anchor}</a>.',
+            f'Когда нужна отправная точка для поездки, удобно посмотреть <a href="{url}">{anchor}</a>.',
         ],
         "general_travel": [
-            f'Если хочется спокойно сравнить общий формат поездки, можно открыть <a href="{url}">{anchor}</a>.',
-            f'Когда нужна общая картина по поездке, удобно посмотреть <a href="{url}">{anchor}</a>.',
+            f'Если хотите сравнить разные сценарии путешествия, можно спокойно открыть <a href="{url}">{anchor}</a>.',
+            f'Когда хочется увидеть общую картину поездки без спешки, посмотрите <a href="{url}">{anchor}</a>.',
         ],
         "cruises": [
-            f'Если такой формат отдыха вам близок, можно заранее посмотреть <a href="{url}">{anchor}</a>.',
-            f'Такие маршруты удобнее сравнить через <a href="{url}">{anchor}</a>.',
+            f'Если вам близок такой формат отдыха, заранее посмотрите <a href="{url}">{anchor}</a>.',
+            f'Такие маршруты особенно удобно сравнивать через <a href="{url}">{anchor}</a>.',
         ],
         "rail_europe": [
-            f'Если речь о маршрутах по Европе, удобнее заранее открыть <a href="{url}">{anchor}</a>.',
-            f'Такие переезды проще сравнить через <a href="{url}">{anchor}</a>.',
+            f'Если собираете маршрут по Европе, удобно заранее открыть <a href="{url}">{anchor}</a>.',
+            f'Такие переезды приятнее планировать, когда под рукой уже есть <a href="{url}">{anchor}</a>.',
         ],
     }
     category = service["category"]
@@ -1305,8 +1381,8 @@ def build_native_link_paragraph(service: Dict[str, Any], template: str) -> str:
     ])
     if template == "selling":
         options = [
-            f'Когда вопрос уже актуален, проще сразу посмотреть <a href="{url}">{anchor}</a>.',
-            f'Если не хочется терять время на лишние сравнения, можно быстро проверить <a href="{url}">{anchor}</a>.',
+            f'Понравилась идея? Начните подготовку спокойно: посмотрите <a href="{url}">{anchor}</a> и сравните варианты.',
+            f'Если хочется перейти от мечты к плану, удобно начать с <a href="{url}">{anchor}</a>.',
         ] + options
     return random.choice(options)
 
@@ -1467,6 +1543,7 @@ async def generate_post_via_openai(
 - стиль: живой, человеческий, читаемый с телефона
 - {style_seed}
 - без канцелярита, штампов, AI-воды
+- не пиши слово "Заголовок" или "Title" в начале поста
 - 1–2 эмодзи, максимум 3
 - длина текста: {length_min}-{length_max} символов
 - {template_structure_hint(template)}
@@ -1475,6 +1552,10 @@ async def generate_post_via_openai(
 - делай абзацы короткими
 - не делай одинаковый шаблонный тон
 - не превращай текст в скучную памятку
+- избегай сухих фраз вроде "вопрос уже актуален", "тема горит", "проще заранее посмотреть"
+- если обещаешь список, количество пунктов в тексте должно точно совпадать с цифрой в заголовке
+- если даёшь подборку событий, мест или советов, не обрывай список на середине
+- финал делай тёплым и человеческим: вдохнови, предложи обсудить планы и мягко подведи к путешествию
 - если тема про место, формат отдыха или атмосферу — добавь ощущение живого интереса
 - если тема про пользу — дай конкретику, а не общие слова
 - {mode_instruction}
@@ -1598,7 +1679,7 @@ def format_post_card(row) -> str:
     )
 
 def build_link_blocks(services: List[Dict[str, Any]], template: str) -> List[str]:
-    return [build_native_link_paragraph(service, template) for service in services[:2]]
+    return [build_native_link_paragraph(service, template) for service in services[:3]]
 
 def format_post_text(
     content: str,
@@ -1614,6 +1695,9 @@ def format_post_text(
     cta_text = build_cta(template, recent_posts)
     if cta_text:
         blocks.append(escape_html_text(cta_text))
+    blocks.append(escape_html_text("Делитесь в комментариях, какие идеи и планы у вас на ближайший отпуск или уикенд."))
+    blocks.append(BRAND_SIGNATURE_HTML)
+    blocks.append(escape_html_text(build_brand_hashtags(content, template, services)))
     credit_block = ""
     if get_setting("photo_attribution_mode", "0") == "1" and photo_credit:
         credit_text = escape_html_text(photo_credit)
@@ -1753,7 +1837,7 @@ async def create_post_record(
         signal_kind=signal_kind,
     )
     services = forced_services if forced_services is not None else choose_services(topic, content, template, recent_posts)
-    referral_url = ",".join([s["url"] for s in services[:2]]) if services else ""
+    referral_url = ",".join([s["url"] for s in services[:3]]) if services else ""
     monetization_service = services[0]["key"] if services else ""
     logger.info(
         "POST_DECISION | version=%s | topic=%s | mode=%s | template=%s | service=%s | urls=%s | source=%s",
@@ -1782,7 +1866,7 @@ async def publish_post_record(bot, channel_id: str, row, mark_status: str = "pub
             }
             services = [make_special_service(special)] if urls else []
         else:
-            for url in urls[:2]:
+            for url in urls[:3]:
                 matched = next((s for s in SERVICES if s["url"] == url), None)
                 if matched:
                     services.append(matched)
@@ -2200,4 +2284,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
