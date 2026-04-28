@@ -22,7 +22,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
 
-APP_VERSION = "travel-matrix-v13-signal-engine"
+APP_VERSION = "travel-matrix-v14-style-guide"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
@@ -261,6 +261,91 @@ OPENING_HOOKS = [
     "Избегай пустых стартов вроде «друзья», «ура», «сегодня расскажем» и начинай сильнее.",
     "Пусть первая строка звучит как авторская мысль, а не как шаблонный рекламный текст.",
 ]
+
+BAD_STYLE_PHRASES = [
+    "давайте разберемся",
+    "вопрос уже актуален",
+    "тема горит",
+    "проще заранее посмотреть",
+    "изюминки",
+    "остаться без изюминки",
+    "проявите мудрость",
+    "вашу соседнюю компанию",
+    "изобилует",
+    "жарень повысилась",
+    "оставаясь верными своему стилю",
+    "идеальный сценарий",
+    "не упустите шанс",
+    "только что купленный парфюм",
+    "долгожданного рейса",
+    "с невероятным ароматом",
+    "что это означает для нас",
+    "позвольте себе уехать в мир",
+    "настоящая мечта",
+    "без неприятных сюрпризов",
+    "станет вишенкой",
+    "вопрос уже не стоит",
+    "вдохновит вас на поездку",
+    "оставит яркие впечатления",
+    "подарит незабываемые эмоции",
+    "ваш идеальный",
+    "готовы к незабываемым",
+    "это не просто",
+    "это шанс",
+    "вас ждут",
+    "отправиться в путь",
+]
+
+LANGUAGE_STYLE_GUIDE = """
+Пиши как сильный русскоязычный Telegram-автор про путешествия.
+
+Что берем из хороших примеров:
+- конкретное наблюдение вместо пустой красивости;
+- живая деталь вместо общего рассуждения;
+- ощущение, что текст можно естественно произнести вслух;
+- один главный вектор поста без мешанины жанров;
+- легкий, точный, уверенный русский язык без канцелярита и синтетики.
+
+Чего избегаем:
+- натужной красивости;
+- фраз, которые человек не сказал бы в реальной речи;
+- псевдорекламного тона;
+- искусственных связок между абзацами;
+- словесного мусора и кривых конструкций.
+""".strip()
+
+STYLE_REFERENCE_POSTS = """
+Ориентиры по стилю и подаче:
+
+remote_russia / ПОНАЕХАВШАЯ
+1. Дубна — сильный заход через атмосферу места, локальные детали, точный образ города и фото, которое усиливает ощущение прогулки.
+2. Кимры — наблюдение, история и фактура города без пафоса, живой голос, точные бытовые детали и хорошая привязка к фото архитектуры.
+3. Углич — исторический сюжет подан как личное открытие, без сухости и без ощущения путеводителя.
+
+arina_travels / ARINA SHUMAKOVA
+4. Тур в ЮАР, Зимбабве, Замбию и Ботсвану — плотный, вкусный список впечатлений, где каждая строка дает образ, а видео/кадры сразу продают масштаб поездки.
+5. Дети в Северной Корее — сильный спорный заход, разговорный тон и простые короткие фразы без сложной лексики.
+6. Пиво и рыба в Северной Корее — бытовая тема раскрыта через наблюдение, а не через штампованный рассказ.
+7. Пост про Лувр Абу-Даби — визуальная доминанта и один ясный угол взгляда, без перегруза.
+8. Скальные церкви Лалибелы и Рождество в Эфиопии — история, легенда и приглашение собраны в одну цельную линию.
+9. Поехали в Эфиопию — энергия приключения держится на конкретике маршрута, а не на пустых эпитетах.
+10. Данакиль / Эфиопия — экстремальная тема подана образно, но при этом понятно и по-человечески.
+
+Общее правило по визуалу:
+- фото или видео должны усиливать центральную мысль поста;
+- лучше один сильный образ, чем случайная красивая картинка;
+- если пост про атмосферу места, фото должно помогать почувствовать ее сразу.
+""".strip()
+
+SECOND_PASS_CHECKLIST = """
+Чек-лист второго редакторского прохода:
+1. Можно ли естественно произнести текст вслух?
+2. Нет ли книжных, рекламных или неловких фраз?
+3. Есть ли в тексте хотя бы одна живая деталь, а не только общие слова?
+4. Есть ли одна главная мысль, без смысловых скачков?
+5. Сохранены ли все факты, даты, цены и условия без выдумки?
+6. Не стал ли текст слишком пафосным, сладким или шаблонным?
+""".strip()
 
 NO_LINK_TEMPLATES = set()
 OPTIONAL_LINK_TEMPLATES = {"useful", "selection", "expert", "mistake", "seasonal", "case", "short", "engagement", "provocation", "trust", "mini_poll"}
@@ -868,6 +953,13 @@ def generated_post_has_unverified_facts(text: str, signal_text: str) -> bool:
             if item.lower() not in allowed:
                 return True
     return False
+
+def find_bad_style_phrases(text: str) -> List[str]:
+    haystack = normalize_text(text)
+    return [phrase for phrase in BAD_STYLE_PHRASES if phrase in haystack]
+
+def has_bad_style_phrases(text: str) -> bool:
+    return bool(find_bad_style_phrases(text))
 
 def looks_incomplete(text: str) -> bool:
     stripped = text.strip()
@@ -1802,6 +1894,12 @@ async def generate_post_via_openai(
 Редакционная логика:
 {editorial_instruction}
 
+Стилевые ориентиры:
+{STYLE_REFERENCE_POSTS}
+
+Чек-лист перед финальной выдачей:
+{SECOND_PASS_CHECKLIST}
+
 {facts_block}
 
 {signal_block}
@@ -1820,6 +1918,69 @@ async def generate_post_via_openai(
     text = (response.choices[0].message.content or "").strip()
     if not text:
         raise ValueError("OpenAI вернул пустой текст")
+    return cleanup_post_text(text)
+
+async def refine_post_language_via_openai(
+    draft_text: str,
+    template: str,
+    content_mode: str = "useful",
+    signal_title: str = "",
+    signal_summary: str = "",
+) -> str:
+    source_facts = extract_source_facts(f"{signal_title}\n{signal_summary}")
+    prompt = f"""
+Ты литературный редактор русского Telegram-канала про путешествия.
+
+Твоя задача: переписать уже готовый текст так, чтобы он звучал красиво, естественно, живо и по-человечески.
+
+Очень важно:
+- не меняй тему поста;
+- не добавляй новых фактов;
+- не придумывай новые цены, даты, месяцы, длительность, температуру или условия;
+- сохрани главную структуру и смысл текста;
+- сохрани длину примерно в тех же пределах;
+- замени синтетические, неестественные и грубые фразы на нормальный живой русский язык;
+- если фраза звучит так, будто человек не сказал бы её вслух, перепиши её;
+- если есть книжная, рекламная или неуклюжая лексика, упрости и оживи;
+- текст должен остаться Telegram-постом, а не стать статьей.
+
+Редакционный формат поста: {editorial_template_name(template)}
+Контент-режим: {content_mode}
+
+{LANGUAGE_STYLE_GUIDE}
+{STYLE_REFERENCE_POSTS}
+
+Обязательно держи в голове:
+{SECOND_PASS_CHECKLIST}
+
+Нельзя использовать или оставлять в тексте фразы вроде:
+{", ".join(BAD_STYLE_PHRASES)}
+
+Проверенные факты из источника:
+- цены: {", ".join(source_facts["prices"]) if source_facts["prices"] else "нет"}
+- даты: {", ".join(source_facts["dates"]) if source_facts["dates"] else "нет"}
+- длительность: {", ".join(source_facts["durations"]) if source_facts["durations"] else "нет"}
+
+Вот черновик поста:
+{draft_text}
+
+Если первая строка слабая, перепиши ее сильнее.
+Если в тексте нет живой детали, добавь одну деталь, но только если она уже содержится в исходном черновике или явно следует из него.
+
+Верни только улучшенную версию текста.
+""".strip()
+    response = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.55,
+        max_tokens=900,
+        messages=[
+            {"role": "system", "content": "Ты сильный редактор русского Telegram-языка. Твоя задача — сделать текст живым, естественным и красивым, не ломая факты."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    text = (response.choices[0].message.content or "").strip()
+    if not text:
+        raise ValueError("Редакторский проход вернул пустой текст")
     return cleanup_post_text(text)
 
 async def generate_post_with_retry(
@@ -1848,10 +2009,20 @@ async def generate_post_with_retry(
                 signal_source_name=signal_source_name,
                 signal_kind=signal_kind,
             )
+            text = await refine_post_language_via_openai(
+                draft_text=text,
+                template=template,
+                content_mode=content_mode,
+                signal_title=signal_title,
+                signal_summary=signal_summary,
+            )
             if looks_incomplete(text):
                 raise ValueError("Сгенерированный текст выглядит незавершённым")
             if generated_post_has_unverified_facts(text, signal_text):
                 raise ValueError("В тексте появились непроверенные даты, цены или длительность, которых нет в источнике")
+            bad_phrases = find_bad_style_phrases(text)
+            if bad_phrases:
+                raise ValueError(f"В тексте остались неестественные речевые обороты: {', '.join(bad_phrases[:5])}")
             return text
         except Exception as exc:
             last_error = exc
