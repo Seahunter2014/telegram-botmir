@@ -22,7 +22,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
 
-APP_VERSION = "travel-matrix-v12-signal-engine"
+APP_VERSION = "travel-matrix-v9-signal-engine"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
@@ -220,6 +220,47 @@ LENGTH_RANGES = {
     "medium": (650, 1100),
     "long": (900, 1450),
 }
+
+EDITORIAL_TEMPLATE_RULES = {
+    "idea_offer": {
+        "templates": {"selling", "seasonal"},
+        "name": "Идея + оффер",
+        "instruction": "Пост должен соединять мечту о поездке, понятную выгоду и мягкую продажу. Дай сильный заход, 3-4 причины, почему это интересно, затем цену/условия и очень естественный переход к ссылке.",
+    },
+    "mystery": {
+        "templates": {"engagement", "mini_poll", "provocation"},
+        "name": "Загадка / интрига",
+        "instruction": "Пост должен строиться вокруг игры, вопроса или угадайки. Дай короткий яркий заход, 3 подсказки максимум, быстрое вовлечение и не растягивай развязку.",
+    },
+    "list": {
+        "templates": {"selection"},
+        "name": "Подборка / список",
+        "instruction": "Пост должен быть подборкой. Если обещаешь число в заголовке, в тексте должно быть ровно столько пунктов. Каждый пункт короткий, читаемый, без лишней воды.",
+    },
+    "useful": {
+        "templates": {"useful", "mistake", "expert"},
+        "name": "Полезность без скуки",
+        "instruction": "Пост должен идти от реальной боли или частой ошибки. Дай 2-4 конкретных пункта, звучащих как совет опытного человека, а не как бюрократическая памятка.",
+    },
+    "dream": {
+        "templates": {"trust", "case", "short", "special_low_price_map", "special_hot_tours", "special_hotels_discount"},
+        "name": "Мечта / вдохновение",
+        "instruction": "Пост должен создавать образ путешествия, который хочется прожить. Добавь атмосферу, живые детали, ощущение красоты и легкий мостик к действию без пафоса.",
+    },
+}
+
+OPENING_HOOKS = [
+    "Начни с сильной первой фразы, которая сразу вызывает эмоцию или любопытство.",
+    "Первая строка должна звучать так, чтобы человеку захотелось дочитать пост до конца.",
+    "Открой пост с короткого образа или сцены, а не с банального вступления.",
+    "Начни с ощущения поездки, будто человек уже мысленно оказался в этом месте.",
+    "Стартуй с живого вопроса, на который хочется ответить самому себе.",
+    "Первая строка может быть как маленькое открытие: неожиданно, но очень жизненно.",
+    "Начало должно быть цепким, но без крикливости и дешевой сенсационности.",
+    "Используй первую фразу как крючок: эмоция, выгода или интрига — но только одна.",
+    "Избегай пустых стартов вроде «друзья», «ура», «сегодня расскажем» и начинай сильнее.",
+    "Пусть первая строка звучит как авторская мысль, а не как шаблонный рекламный текст.",
+]
 
 NO_LINK_TEMPLATES = set()
 OPTIONAL_LINK_TEMPLATES = {"useful", "selection", "expert", "mistake", "seasonal", "case", "short", "engagement", "provocation", "trust", "mini_poll"}
@@ -785,6 +826,49 @@ def cleanup_post_text(text: str) -> str:
     text = re.sub(r"\n\s*Заголовок\s*:\s*", "\n", text, flags=re.IGNORECASE)
     return text.strip()
 
+def extract_source_facts(text: str) -> Dict[str, List[str]]:
+    source = text or ""
+    price_patterns = [
+        r"\b\d[\d\s]{1,12}(?:[.,]\d+)?\s?(?:₽|руб\.?|рублей|рубля)\b",
+        r"\b\d[\d\s]{1,12}(?:[.,]\d+)?\s?(?:\$|€|AED|USD|EUR)\b",
+        r"\bот\s+\d[\d\s]{1,12}(?:[.,]\d+)?\s?(?:₽|руб\.?|рублей|рубля|\$|€|AED|USD|EUR)\b",
+    ]
+    date_patterns = [
+        r"\b\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b",
+        r"\b\d{1,2}\.\d{1,2}(?:\.\d{2,4})?\b",
+        r"\b(?:май|июнь|июль|август|сентябрь|октябрь|ноябрь|декабрь|январь|февраль|март|апрель)\b",
+    ]
+    duration_patterns = [
+        r"\b\d+\s*(?:ноч[еиь]|дн(?:я|ей))\b",
+    ]
+    facts = {"prices": [], "dates": [], "durations": []}
+    for pattern in price_patterns:
+        facts["prices"].extend(re.findall(pattern, source, re.IGNORECASE))
+    for pattern in date_patterns:
+        facts["dates"].extend(re.findall(pattern, source, re.IGNORECASE))
+    for pattern in duration_patterns:
+        facts["durations"].extend(re.findall(pattern, source, re.IGNORECASE))
+    for key in facts:
+        seen = []
+        for item in facts[key]:
+            normalized = re.sub(r"\s+", " ", item.strip())
+            if normalized and normalized not in seen:
+                seen.append(normalized)
+        facts[key] = seen[:8]
+    return facts
+
+def generated_post_has_unverified_facts(text: str, signal_text: str) -> bool:
+    if not signal_text.strip():
+        return False
+    source_facts = extract_source_facts(signal_text)
+    post_facts = extract_source_facts(text)
+    for key in ("prices", "dates", "durations"):
+        allowed = set(x.lower() for x in source_facts[key])
+        for item in post_facts[key]:
+            if item.lower() not in allowed:
+                return True
+    return False
+
 def looks_incomplete(text: str) -> bool:
     stripped = text.strip()
     if len(stripped) < 260:
@@ -1192,6 +1276,18 @@ def template_family(template: str) -> str:
     }
     return families.get(template, template)
 
+def editorial_template_name(template: str) -> str:
+    for rule in EDITORIAL_TEMPLATE_RULES.values():
+        if template in rule["templates"]:
+            return rule["name"]
+    return "Свободный формат"
+
+def editorial_template_instruction(template: str) -> str:
+    for rule in EDITORIAL_TEMPLATE_RULES.values():
+        if template in rule["templates"]:
+            return rule["instruction"]
+    return "Выбери один главный формат поста и не смешивай в одном тексте загадку, подборку, продажу и памятку одновременно."
+
 def choose_post_template(content_mode: Optional[str] = None) -> str:
     weights_map = MODE_TEMPLATE_WEIGHTS.get(content_mode or "", POST_TEMPLATES)
     stats = get_content_stats()
@@ -1582,18 +1678,18 @@ async def fetch_pexels_photo(topic: str) -> Tuple[Optional[str], Optional[str], 
 
 def build_template_instruction(template: str) -> str:
     mapping = {
-        "useful": "Сделай полезный практический пост с конкретной пользой и без воды.",
-        "mistake": "Сделай пост в формате ошибка / антиошибка: что люди делают не так и как исправить.",
-        "selection": "Сделай пост в формате подборки / рейтинга / сравнения вариантов.",
-        "engagement": "Сделай вовлекающий вопрос, который вызывает комментарии и обсуждение.",
-        "provocation": "Сделай провокационный, но не токсичный пост со спорным тезисом.",
-        "trust": "Сделай доверительный пост как личное наблюдение автора.",
-        "expert": "Сделай экспертный разбор с неочевидимым нюансом.",
-        "seasonal": "Сделай сезонный / ситуативный пост, привязанный к моменту.",
-        "case": "Сделай мини-кейс или короткую историю ситуации.",
-        "selling": "Сделай мягко продающий пост без прямой рекламы, через проблему и решение.",
-        "mini_poll": "Сделай мини-анкету или быстрый опрос.",
-        "short": "Сделай короткий ситуативный пост в 2–4 абзаца.",
+        "useful": "Сделай полезный практический пост с конкретной пользой, живым человеческим тоном и без воды.",
+        "mistake": "Сделай пост в формате ошибка / антиошибка: что люди делают не так и как избежать этой проблемы без лишней нравоучительности.",
+        "selection": "Сделай пост в формате подборки или списка, где структура очень чистая и каждый пункт реально дает ценность.",
+        "engagement": "Сделай вовлекающий вопрос или легкую интригу, которая вызывает комментарии и обсуждение.",
+        "provocation": "Сделай пост со спорным, но жизненным тезисом, который провоцирует разговор, а не раздражение.",
+        "trust": "Сделай теплый доверительный пост, как наблюдение человека, который правда любит путешествия.",
+        "expert": "Сделай экспертный разбор с неочевидимым нюансом, но так, чтобы его хотелось дочитать.",
+        "seasonal": "Сделай сезонный или ситуативный пост с ощущением момента и реальным поводом поехать.",
+        "case": "Сделай мини-кейс или короткую историю, которая звучит живо и легко.",
+        "selling": "Сделай мягко продающий пост через мечту, выгоду и естественный переход к действию, без рекламного нажима.",
+        "mini_poll": "Сделай мини-опрос или быструю угадайку, которая вызывает реакцию и не утомляет.",
+        "short": "Сделай короткий, но атмосферный пост в 2–4 абзаца с сильным первым заходом.",
         "special_low_price_map": "Сделай пост на тему карты низких цен на авиабилеты. Это должен быть полезный, понятный и живой пост.",
         "special_hot_tours": "Сделай пост на тему горящих туров. Это должен быть живой и удобный для Telegram пост.",
         "special_hotels_discount": "Сделай пост на тему отелей со скидкой до 80%.",
@@ -1623,6 +1719,18 @@ async def generate_post_via_openai(
     signal_kind: str = "",
 ) -> str:
     length_min, length_max = get_length_range(template)
+    editorial_name = editorial_template_name(template)
+    editorial_instruction = editorial_template_instruction(template)
+    opening_hook = random.choice(OPENING_HOOKS)
+    source_facts = extract_source_facts(f"{signal_title}\n{signal_summary}")
+    facts_block = ""
+    if signal_title or signal_summary:
+        facts_block = f"""
+Проверенные факты из источника:
+- цены: {", ".join(source_facts["prices"]) if source_facts["prices"] else "в источнике нет точных цен"}
+- даты: {", ".join(source_facts["dates"]) if source_facts["dates"] else "в источнике нет точных дат"}
+- длительность: {", ".join(source_facts["durations"]) if source_facts["durations"] else "в источнике нет точной длительности"}
+""".strip()
     style_seed = random.choice([
         "пиши так, будто это авторский Telegram-канал, а не статья",
         "пиши легко, с ощущением живого travel-канала",
@@ -1656,10 +1764,12 @@ async def generate_post_via_openai(
 - язык: русский
 - стиль: живой, человеческий, читаемый с телефона
 - {style_seed}
+- {opening_hook}
 - без канцелярита, штампов, AI-воды
 - не пиши слово "Заголовок" или "Title" в начале поста
 - 1–2 эмодзи, максимум 3
 - длина текста: {length_min}-{length_max} символов
+- редакционный формат: {editorial_name}
 - {template_structure_hint(template)}
 - текст должен быть законченным
 - не используй markdown со звёздочками
@@ -1669,7 +1779,18 @@ async def generate_post_via_openai(
 - избегай сухих фраз вроде "вопрос уже актуален", "тема горит", "проще заранее посмотреть"
 - если обещаешь список, количество пунктов в тексте должно точно совпадать с цифрой в заголовке
 - если даёшь подборку событий, мест или советов, не обрывай список на середине
+- внимательно следи за внутренней логикой текста: начало, середина и финал должны работать как один цельный пост
+- не делай смысловых скачков и не смешивай в одном посте слишком много разных задач
 - финал делай тёплым и человеческим: вдохнови, предложи обсудить планы и мягко подведи к путешествию
+- выбери один главный формат поста и держи его до конца, не смешивай в одном тексте загадку, подборку, памятку и прямую продажу сразу
+- если это полезный пост, избегай банальностей и очевидных советов без нового угла
+- если это вдохновляющий пост, добавляй образ, настроение и живые детали
+- если это продающий пост, сначала дай почувствовать поездку и только потом подводи к действию
+- первая строка должна быть заметно сильнее среднего: цепкая, живая и без ощущения шаблона
+- не начинай пост с пустых фраз вроде «сегодня расскажем», «друзья», «ура» или «давайте поговорим»
+- если в источнике есть точные цены, даты, месяцы, длительность или условия, используй только их и не придумывай свои
+- если в источнике нет точной цены, даты, длительности или температуры, не добавляй выдуманные цифры
+- не преувеличивай скидки, погоду, отзывы, условия тура и сроки, если этого нет в источнике
 - если тема про место, формат отдыха или атмосферу — добавь ощущение живого интереса
 - если тема про пользу — дай конкретику, а не общие слова
 - {mode_instruction}
@@ -1677,6 +1798,11 @@ async def generate_post_via_openai(
 
 Инструкция:
 {build_template_instruction(template)}
+
+Редакционная логика:
+{editorial_instruction}
+
+{facts_block}
 
 {signal_block}
 
@@ -1709,6 +1835,7 @@ async def generate_post_with_retry(
     delay: int = 4,
 ) -> str:
     last_error = None
+    signal_text = f"{signal_title}\n{signal_summary}".strip()
     for attempt in range(1, retries + 1):
         try:
             text = await generate_post_via_openai(
@@ -1723,6 +1850,8 @@ async def generate_post_with_retry(
             )
             if looks_incomplete(text):
                 raise ValueError("Сгенерированный текст выглядит незавершённым")
+            if generated_post_has_unverified_facts(text, signal_text):
+                raise ValueError("В тексте появились непроверенные даты, цены или длительность, которых нет в источнике")
             return text
         except Exception as exc:
             last_error = exc
@@ -1814,6 +1943,7 @@ def render_post_preview(row) -> str:
     if not row:
         return ""
     recent_posts = get_recent_posts(7)
+    max_len = 1024 if row["photo_path"] else 4096
     return format_post_text(
         content=row["content"] or "",
         template=row["post_type"] or "useful",
@@ -1821,7 +1951,7 @@ def render_post_preview(row) -> str:
         recent_posts=recent_posts,
         photo_credit=row["photo_credit"],
         photo_source_url=row["photo_source_url"],
-        max_plain_len=4096,
+        max_plain_len=max_len,
     )
 
 def build_link_blocks(services: List[Dict[str, Any]], template: str) -> List[str]:
@@ -2058,19 +2188,13 @@ async def publish_post_record(bot, channel_id: str, row, mark_status: str = "pub
         recent_posts=recent_posts,
         photo_credit=row["photo_credit"],
         photo_source_url=row["photo_source_url"],
-        max_plain_len=4096,
+        max_plain_len=1024 if row["photo_path"] else 4096,
     )
     reply_markup = build_inline_buttons(services, row["id"])
     photo_path = row["photo_path"]
-    plain_text_len = len(re.sub(r"<[^>]+>", "", text))
     if photo_path and Path(photo_path).exists():
-        if plain_text_len <= 1024:
-            with open(photo_path, "rb") as photo_file:
-                await bot.send_photo(chat_id=channel_id, photo=photo_file, caption=text, parse_mode="HTML", reply_markup=reply_markup)
-        else:
-            with open(photo_path, "rb") as photo_file:
-                await bot.send_photo(chat_id=channel_id, photo=photo_file)
-            await bot.send_message(chat_id=channel_id, text=text, parse_mode="HTML", disable_web_page_preview=False, reply_markup=reply_markup)
+        with open(photo_path, "rb") as photo_file:
+            await bot.send_photo(chat_id=channel_id, photo=photo_file, caption=text, parse_mode="HTML", reply_markup=reply_markup)
     else:
         await bot.send_message(chat_id=channel_id, text=text, parse_mode="HTML", disable_web_page_preview=False, reply_markup=reply_markup)
     update_post_status(row["id"], mark_status)
